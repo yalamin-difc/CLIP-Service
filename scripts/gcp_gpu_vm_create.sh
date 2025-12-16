@@ -7,14 +7,15 @@ set -euo pipefail
 : "${PROJECT_ID:?Set PROJECT_ID (e.g. export PROJECT_ID=my-project)}"
 
 NAME="${NAME:-gpu-vm-1}"
-ZONE="${ZONE:-us-central1-a}"
+ZONE="${ZONE:-me-central1-a}"
 
-# Common, widely-available GPU: T4. Change to e.g. nvidia-l4 if you have quota.
-GPU_TYPE="${GPU_TYPE:-nvidia-tesla-t4}"
+# Default for G2: machine type includes NVIDIA L4 (1 GPU on g2-standard-8).
+# If you switch to a non-G2 machine type, you can still set GPU_TYPE/GPU_COUNT.
+GPU_TYPE="${GPU_TYPE:-nvidia-l4}"
 GPU_COUNT="${GPU_COUNT:-1}"
 
-# Pick a machine type that exists in your chosen zone.
-MACHINE_TYPE="${MACHINE_TYPE:-n1-standard-8}"
+# Middle East default: G2 (L4) with 1 GPU.
+MACHINE_TYPE="${MACHINE_TYPE:-g2-standard-8}"
 
 # Deep Learning VM image with CUDA preinstalled (recommended).
 IMAGE_FAMILY="${IMAGE_FAMILY:-common-cu121}"
@@ -76,26 +77,38 @@ else
   echo "Firewall rule already exists: $FIREWALL_RULE_NAME"
 fi
 
-echo "Creating VM '$NAME' in $ZONE with $GPU_COUNT x $GPU_TYPE"
+if [[ "$MACHINE_TYPE" == g2-* ]]; then
+  echo "Creating G2 VM '$NAME' in $ZONE (machine-type: $MACHINE_TYPE, includes NVIDIA L4 GPU)"
+else
+  echo "Creating VM '$NAME' in $ZONE with $GPU_COUNT x $GPU_TYPE (machine-type: $MACHINE_TYPE)"
+fi
 
-gcloud compute instances create "$NAME" \
-  --project "$PROJECT_ID" \
-  --zone "$ZONE" \
-  --machine-type "$MACHINE_TYPE" \
-  --maintenance-policy TERMINATE \
-  --restart-on-failure \
-  --provisioning-model STANDARD \
-  --accelerator "type=${GPU_TYPE},count=${GPU_COUNT}" \
-  --image-family "$IMAGE_FAMILY" \
-  --image-project "$IMAGE_PROJECT" \
-  --boot-disk-size "$BOOT_DISK_SIZE" \
-  --boot-disk-type "$BOOT_DISK_TYPE" \
-  --tags "$NETWORK_TAGS" \
-  --scopes "https://www.googleapis.com/auth/cloud-platform" \
-  --metadata-from-file startup-script="$STARTUP_SCRIPT_PATH" \
-  --no-shielded-secure-boot \
-  --shielded-vtpm \
+CREATE_ARGS=(
+  compute instances create "$NAME"
+  --project "$PROJECT_ID"
+  --zone "$ZONE"
+  --machine-type "$MACHINE_TYPE"
+  --maintenance-policy TERMINATE
+  --restart-on-failure
+  --provisioning-model STANDARD
+  --image-family "$IMAGE_FAMILY"
+  --image-project "$IMAGE_PROJECT"
+  --boot-disk-size "$BOOT_DISK_SIZE"
+  --boot-disk-type "$BOOT_DISK_TYPE"
+  --tags "$NETWORK_TAGS"
+  --scopes "https://www.googleapis.com/auth/cloud-platform"
+  --metadata-from-file startup-script="$STARTUP_SCRIPT_PATH"
+  --no-shielded-secure-boot
+  --shielded-vtpm
   --shielded-integrity-monitoring
+)
+
+# For non-G2 machines, attach a GPU explicitly.
+if [[ "$MACHINE_TYPE" != g2-* ]]; then
+  CREATE_ARGS+=( --accelerator "type=${GPU_TYPE},count=${GPU_COUNT}" )
+fi
+
+gcloud "${CREATE_ARGS[@]}"
 
 echo
 
