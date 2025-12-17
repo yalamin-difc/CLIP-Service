@@ -5,7 +5,6 @@ from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import torch
 import io
-import json
 
 app = FastAPI(title="CLIP Service")
 
