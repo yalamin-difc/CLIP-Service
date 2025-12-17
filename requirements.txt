@@ -1,0 +1,24 @@
+
+fastapi
+uvicorn
+pillow
+
+# CPU versions (Cloud Run friendly)
+torch==2.2.0+cpu
+torchvision==0.17.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+sentence-transformers
+python-multipart
+gunicorn
+numpy
+scikit-learn
+pymongo
+ftfy
+regex
+tqdm
+
+# OpenAI CLIP
+git+https://github.com/openai/CLIP.git
+
+
