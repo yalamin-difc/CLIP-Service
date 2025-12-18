@@ -1,6 +1,7 @@
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from transformers import CLIPProcessor, CLIPModel
@@ -30,6 +31,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------
+# Auth (optional)
+# If CLIP_API_KEY is set, require:
+#   Authorization: Bearer <CLIP_API_KEY>
+# ---------------------------------------------------------
+import os
+
+CLIP_API_KEY = os.environ.get("CLIP_API_KEY", "").strip()
+
+
+def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
+    if not CLIP_API_KEY:
+        return  # auth disabled
+    if authorization != f"Bearer {CLIP_API_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ---------------------------------------------------------
 # LAZY LOADING (Cloud Run Safe)
@@ -73,6 +90,22 @@ UI_HTML = r"""<!doctype html>
           <div id="baseUrl" class="font-mono text-sm text-slate-200"></div>
         </div>
       </div>
+
+      <section class="mb-6 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+        <div class="flex items-end justify-between gap-4">
+          <div>
+            <h2 class="text-lg font-semibold">Authorization (optional)</h2>
+            <p class="text-sm text-slate-400 mt-1">If the server has <span class="font-mono">CLIP_API_KEY</span> set, paste it here to use the UI.</p>
+          </div>
+          <div class="text-xs text-slate-500">Header: <span class="font-mono">Authorization: Bearer ...</span></div>
+        </div>
+        <div class="mt-4 flex flex-col md:flex-row gap-3 items-stretch">
+          <input id="tokenInput" type="password" class="flex-1 rounded-xl bg-slate-950/60 border border-slate-800 p-3 outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Bearer token (optional)" />
+          <button id="btnSaveToken" class="rounded-xl bg-slate-800 hover:bg-slate-700 px-4 py-2 text-sm font-semibold">Save</button>
+          <button id="btnClearToken" class="rounded-xl bg-slate-800 hover:bg-slate-700 px-4 py-2 text-sm font-semibold">Clear</button>
+        </div>
+        <div id="tokenStatus" class="mt-2 text-xs text-slate-400"></div>
+      </section>
 
       <div class="grid md:grid-cols-2 gap-6">
         <!-- Encode Text -->
@@ -166,6 +199,42 @@ UI_HTML = r"""<!doctype html>
       const base = window.location.origin;
       document.getElementById("baseUrl").textContent = base;
 
+      // Token storage for UI requests (optional)
+      const tokenInput = document.getElementById("tokenInput");
+      const tokenStatus = document.getElementById("tokenStatus");
+      const KEY = "clip_api_token";
+
+      function getToken() {
+        return (localStorage.getItem(KEY) || "").trim();
+      }
+
+      function setToken(v) {
+        const t = (v || "").trim();
+        if (!t) {
+          localStorage.removeItem(KEY);
+        } else {
+          localStorage.setItem(KEY, t);
+        }
+      }
+
+      function authHeader() {
+        const t = getToken();
+        return t ? { Authorization: `Bearer ${t}` } : {};
+      }
+
+      // Init token UI
+      tokenInput.value = getToken();
+      tokenStatus.textContent = getToken() ? "Token loaded from this browser." : "No token set (public mode).";
+      document.getElementById("btnSaveToken").addEventListener("click", () => {
+        setToken(tokenInput.value);
+        tokenStatus.textContent = getToken() ? "Token saved." : "Token cleared.";
+      });
+      document.getElementById("btnClearToken").addEventListener("click", () => {
+        tokenInput.value = "";
+        setToken("");
+        tokenStatus.textContent = "Token cleared.";
+      });
+
       const fmt = (obj) => JSON.stringify(obj, null, 2);
       const clipVec = (v) => {
         if (!Array.isArray(v)) return v;
@@ -198,7 +267,7 @@ UI_HTML = r"""<!doctype html>
         try {
           const fd = new FormData();
           fd.append("text", text);
-          const r = await fetch(`${base}/encode-text`, { method: "POST", body: fd });
+          const r = await fetch(`${base}/encode-text`, { method: "POST", body: fd, headers: authHeader() });
           const body = await r.json().catch(() => ({}));
           if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
           out.textContent = fmt({ embedding: clipVec(body.embedding) });
@@ -221,7 +290,7 @@ UI_HTML = r"""<!doctype html>
         try {
           const fd = new FormData();
           fd.append("file", f);
-          const r = await fetch(`${base}/encode-image`, { method: "POST", body: fd });
+          const r = await fetch(`${base}/encode-image`, { method: "POST", body: fd, headers: authHeader() });
           const body = await r.json().catch(() => ({}));
           if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
           out.textContent = fmt({ embedding: clipVec(body.embedding) });
@@ -249,7 +318,7 @@ UI_HTML = r"""<!doctype html>
           const fd = new FormData();
           fd.append("file1", f1);
           fd.append("file2", f2);
-          const r = await fetch(`${base}/similarity`, { method: "POST", body: fd });
+          const r = await fetch(`${base}/similarity`, { method: "POST", body: fd, headers: authHeader() });
           const body = await r.json().catch(() => ({}));
           if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
           scoreEl.textContent = Number(body.similarity).toFixed(6);
@@ -276,7 +345,9 @@ def ui():
 async def encode_image(
     file: Optional[UploadFile] = File(default=None),
     image: Optional[UploadFile] = File(default=None),
+    authorization: Optional[str] = Header(default=None),
 ):
+    require_auth(authorization)
     model, processor = load_model()
 
     upload = file or image
@@ -297,7 +368,12 @@ async def encode_image(
 # Text Encoding
 # ---------------------------------------------------------
 @app.post("/encode-text")
-async def encode_text(text: Optional[str] = Form(default=None), queryText: Optional[str] = Form(default=None)):
+async def encode_text(
+    text: Optional[str] = Form(default=None),
+    queryText: Optional[str] = Form(default=None),
+    authorization: Optional[str] = Header(default=None),
+):
+    require_auth(authorization)
     model, processor = load_model()
 
     value = (text or queryText or "").strip()
@@ -322,7 +398,9 @@ async def similarity(
     file2: Optional[UploadFile] = File(default=None),
     image1: Optional[UploadFile] = File(default=None),
     image2: Optional[UploadFile] = File(default=None),
+    authorization: Optional[str] = Header(default=None),
 ):
+    require_auth(authorization)
     model, processor = load_model()
 
     u1 = file1 or image1
