@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from transformers import CLIPProcessor, CLIPModel
@@ -285,11 +285,18 @@ def ui():
 # Image Encoding
 # ---------------------------------------------------------
 @app.post("/encode-image")
-async def encode_image(file: UploadFile = File(...)):
+async def encode_image(
+    file: UploadFile | None = File(default=None),
+    image: UploadFile | None = File(default=None),
+):
     model, processor = load_model()
 
-    image = Image.open(io.BytesIO(await file.read())).convert("RGB")
-    inputs = processor(images=image, return_tensors="pt")
+    upload = file or image
+    if upload is None:
+        raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
+
+    pil_image = Image.open(io.BytesIO(await upload.read())).convert("RGB")
+    inputs = processor(images=pil_image, return_tensors="pt")
 
     with torch.no_grad():
         embedding = model.get_image_features(**inputs)
@@ -302,10 +309,14 @@ async def encode_image(file: UploadFile = File(...)):
 # Text Encoding
 # ---------------------------------------------------------
 @app.post("/encode-text")
-async def encode_text(text: str = Form(...)):
+async def encode_text(text: str | None = Form(default=None), queryText: str | None = Form(default=None)):
     model, processor = load_model()
 
-    inputs = processor(text=[text], return_tensors="pt", padding=True)
+    value = (text or queryText or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="No text provided. Use form field 'text' (or 'queryText').")
+
+    inputs = processor(text=[value], return_tensors="pt", padding=True)
 
     with torch.no_grad():
         embedding = model.get_text_features(**inputs)
@@ -318,11 +329,24 @@ async def encode_text(text: str = Form(...)):
 # Image Similarity
 # ---------------------------------------------------------
 @app.post("/similarity")
-async def similarity(file1: UploadFile = File(...), file2: UploadFile = File(...)):
+async def similarity(
+    file1: UploadFile | None = File(default=None),
+    file2: UploadFile | None = File(default=None),
+    image1: UploadFile | None = File(default=None),
+    image2: UploadFile | None = File(default=None),
+):
     model, processor = load_model()
 
-    img1 = Image.open(file1.file).convert("RGB")
-    img2 = Image.open(file2.file).convert("RGB")
+    u1 = file1 or image1
+    u2 = file2 or image2
+    if u1 is None or u2 is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Two images required. Use fields file1/file2 (or image1/image2).",
+        )
+
+    img1 = Image.open(u1.file).convert("RGB")
+    img2 = Image.open(u2.file).convert("RGB")
 
     inputs = processor(images=[img1, img2], return_tensors="pt")
 
