@@ -4,8 +4,10 @@ uvicorn
 pillow
 
 # CPU versions (Cloud Run friendly)
-torch==2.2.0+cpu
-torchvision==0.17.0+cpu
+# NOTE: transformers now requires torch>=2.6 for safe torch.load behavior.
+torch==2.6.0+cpu
+torchvision==0.21.0+cpu
+torchaudio==2.6.0+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 sentence-transformers
