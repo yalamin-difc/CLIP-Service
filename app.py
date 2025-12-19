@@ -4,6 +4,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from datetime import datetime, timezone
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import torch
@@ -69,6 +70,31 @@ def load_model():
 @app.get("/")
 def home():
     return {"status": "running", "model_loaded": model is not None}
+
+
+# ---------------------------------------------------------
+# Compatibility: Lost & Found "home metrics" endpoint
+# ---------------------------------------------------------
+# Some clients expect a Lost & Found API endpoint at:
+#   GET /api/metrics/home
+#
+# This service primarily provides CLIP embedding endpoints, but we expose a
+# minimal metrics payload so those clients don't hard-fail with a 404.
+@app.get("/api/metrics/home")
+def home_metrics():
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "success": True,
+        "data": {
+            # Common dashboard counters (default to 0 in this service).
+            "lostReports": 0,
+            "foundReports": 0,
+            "matches": 0,
+            "activeUsers": 0,
+            "lastUpdated": now,
+            "service": "clip",
+        },
+    }
 
 UI_HTML = r"""<!doctype html>
 <html lang="en">
