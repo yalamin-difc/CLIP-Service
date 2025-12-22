@@ -8,6 +8,13 @@ from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import torch
 import io
+import uuid
+from datetime import datetime, timezone
+
+from barcode_service import scan_barcodes
+from match_service import build_explanation, cosine_similarity, softmax_confidences
+from ocr_service import extract_ocr
+from storage import SqliteStore
 
 app = FastAPI(title="CLIP Service")
 
@@ -40,6 +47,9 @@ app.add_middleware(
 import os
 
 CLIP_API_KEY = os.environ.get("CLIP_API_KEY", "").strip()
+DB_PATH = os.environ.get("DB_PATH", "/tmp/clip_service.sqlite").strip() or "/tmp/clip_service.sqlite"
+
+store = SqliteStore(DB_PATH)
 
 
 def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
@@ -62,6 +72,26 @@ def load_model():
         processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
         print("✅ CLIP model ready!")
     return model, processor
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _upload_to_pil(upload: UploadFile) -> Image.Image:
+    try:
+        raw = await upload.read()
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Invalid image upload") from e
+
+
+def _normalize_embedding(emb: torch.Tensor) -> torch.Tensor:
+    emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
+    return emb
+
+
+def _request_id_from_header(h: Optional[str]) -> str:
+    return (h or "").strip() or str(uuid.uuid4())
 
 # ---------------------------------------------------------
 # Health check
@@ -360,7 +390,7 @@ async def encode_image(
     with torch.no_grad():
         embedding = model.get_image_features(**inputs)
 
-    embedding = embedding / embedding.norm(p=2, dim=-1, keepdim=True)
+    embedding = _normalize_embedding(embedding)
     return {"embedding": embedding.squeeze().tolist()}
 
 
@@ -385,7 +415,7 @@ async def encode_text(
     with torch.no_grad():
         embedding = model.get_text_features(**inputs)
 
-    embedding = embedding / embedding.norm(p=2, dim=-1, keepdim=True)
+    embedding = _normalize_embedding(embedding)
     return {"embedding": embedding.squeeze().tolist()}
 
 
@@ -416,7 +446,353 @@ async def similarity(
     with torch.no_grad():
         emb = model.get_image_features(**inputs)
 
-    emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
+    emb = _normalize_embedding(emb)
     sim = float(torch.mm(emb[0:1], emb[1:2].T))
 
     return {"similarity": sim}
+
+
+# ---------------------------------------------------------
+# OCR / Barcode / Match / Items / Audit Logs
+# ---------------------------------------------------------
+@app.post("/analyze-image")
+async def analyze_image(
+    file: Optional[UploadFile] = File(default=None),
+    image: Optional[UploadFile] = File(default=None),
+    doOcr: bool = Form(default=True),
+    doBarcode: bool = Form(default=True),
+    ocrLang: str = Form(default="eng"),
+    ocrPsm: int = Form(default=6),
+    authorization: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
+):
+    """
+    One-shot analysis for a single image:
+      - CLIP embedding
+      - OCR (Tesseract)
+      - Barcode scan (ZXing)
+    """
+    require_auth(authorization)
+    model, processor = load_model()
+
+    upload = file or image
+    if upload is None:
+        raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
+    request_id = _request_id_from_header(x_request_id)
+
+    pil_image = await _upload_to_pil(upload)
+
+    # CLIP
+    inputs = processor(images=pil_image, return_tensors="pt")
+    with torch.no_grad():
+        embedding = model.get_image_features(**inputs)
+    embedding = _normalize_embedding(embedding).squeeze().tolist()
+
+    # OCR / Barcode
+    ocr = None
+    ocr_error = None
+    if doOcr:
+        try:
+            ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
+            store.add_audit_log(
+                event_type="OCR_EXTRACT",
+                request_id=request_id,
+                payload={"meta": ocr.get("meta"), "wordCount": len(ocr.get("words") or []), "fullText": ocr.get("fullText")},
+            )
+        except Exception as e:
+            ocr_error = str(e)
+            store.add_audit_log(
+                event_type="OCR_EXTRACT_FAILED",
+                request_id=request_id,
+                payload={"error": ocr_error, "ocrLang": ocrLang, "ocrPsm": int(ocrPsm)},
+            )
+
+    barcode = None
+    barcode_error = None
+    if doBarcode:
+        try:
+            barcode = scan_barcodes(pil_image)
+            store.add_audit_log(
+                event_type="BARCODE_SCAN",
+                request_id=request_id,
+                payload={"meta": barcode.get("meta"), "barcodes": barcode.get("barcodes")},
+            )
+        except Exception as e:
+            barcode_error = str(e)
+            store.add_audit_log(
+                event_type="BARCODE_SCAN_FAILED",
+                request_id=request_id,
+                payload={"error": barcode_error},
+            )
+
+    return {
+        "requestId": request_id,
+        "embedding": embedding,
+        "ocr": ocr,
+        "ocrError": ocr_error,
+        "barcode": barcode,
+        "barcodeError": barcode_error,
+    }
+
+
+@app.post("/items")
+async def create_item(
+    name: str = Form(...),
+    description: Optional[str] = Form(default=None),
+    file: Optional[UploadFile] = File(default=None),
+    image: Optional[UploadFile] = File(default=None),
+    doOcr: bool = Form(default=True),
+    doBarcode: bool = Form(default=True),
+    ocrLang: str = Form(default="eng"),
+    ocrPsm: int = Form(default=6),
+    authorization: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
+):
+    """Create an item, storing CLIP embedding + optional OCR + barcode results."""
+    require_auth(authorization)
+    model, processor = load_model()
+
+    upload = file or image
+    if upload is None:
+        raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
+    request_id = _request_id_from_header(x_request_id)
+
+    pil_image = await _upload_to_pil(upload)
+
+    # CLIP
+    inputs = processor(images=pil_image, return_tensors="pt")
+    with torch.no_grad():
+        emb = model.get_image_features(**inputs)
+    emb = _normalize_embedding(emb).squeeze().tolist()
+
+    # OCR / Barcode
+    ocr_text = None
+    ocr_words = None
+    if doOcr:
+        try:
+            ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
+            ocr_text = ocr.get("fullText")
+            ocr_words = ocr.get("words")
+        except Exception as e:
+            store.add_audit_log(
+                event_type="OCR_EXTRACT_FAILED",
+                request_id=request_id,
+                payload={"error": str(e), "ocrLang": ocrLang, "ocrPsm": int(ocrPsm)},
+            )
+
+    barcodes = None
+    if doBarcode:
+        try:
+            barcode = scan_barcodes(pil_image)
+            barcodes = barcode.get("barcodes")
+        except Exception as e:
+            store.add_audit_log(event_type="BARCODE_SCAN_FAILED", request_id=request_id, payload={"error": str(e)})
+
+    item = store.create_item(
+        name=name.strip(),
+        description=(description.strip() if description else None),
+        clip_embedding=emb,
+        ocr_text=ocr_text,
+        ocr_words=ocr_words,
+        barcodes=barcodes,
+        status="draft",
+    )
+
+    store.add_audit_log(
+        event_type="ITEM_CREATED",
+        item_id=item["id"],
+        request_id=request_id,
+        payload={"name": item["name"], "description": item["description"], "status": item["status"]},
+    )
+    if ocr_text is not None:
+        store.add_audit_log(
+            event_type="OCR_EXTRACT",
+            item_id=item["id"],
+            request_id=request_id,
+            payload={"meta": {"lang": ocrLang, "psm": int(ocrPsm)}, "wordCount": len(ocr_words or []), "fullText": ocr_text},
+        )
+    if barcodes is not None:
+        store.add_audit_log(
+            event_type="BARCODE_SCAN",
+            item_id=item["id"],
+            request_id=request_id,
+            payload={"barcodes": barcodes},
+        )
+
+    return {"requestId": request_id, "item": item}
+
+
+@app.get("/items")
+def list_items(
+    status: Optional[str] = None,
+    limit: int = 500,
+    authorization: Optional[str] = Header(default=None),
+):
+    require_auth(authorization)
+    return {"items": store.list_items(status=status, limit=limit)}
+
+
+@app.get("/items/{item_id}")
+def get_item(
+    item_id: str,
+    authorization: Optional[str] = Header(default=None),
+):
+    require_auth(authorization)
+    try:
+        return {"item": store.get_item(item_id)}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+
+@app.post("/items/{item_id}/release")
+def release_item(
+    item_id: str,
+    authorization: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
+):
+    require_auth(authorization)
+    request_id = _request_id_from_header(x_request_id)
+    try:
+        item = store.set_item_status(item_id, status="released", released=True)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    store.add_audit_log(
+        event_type="ITEM_RELEASE",
+        item_id=item_id,
+        request_id=request_id,
+        payload={"status": "released", "releasedAt": item.get("releasedAt")},
+    )
+    return {"requestId": request_id, "item": item}
+
+
+@app.get("/audit-logs")
+def list_audit_logs(
+    itemId: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+    authorization: Optional[str] = Header(default=None),
+):
+    require_auth(authorization)
+    return {"logs": store.list_audit_logs(item_id=itemId, limit=limit, offset=offset)}
+
+
+@app.post("/match")
+async def match_top_k(
+    file: Optional[UploadFile] = File(default=None),
+    image: Optional[UploadFile] = File(default=None),
+    queryText: Optional[str] = Form(default=None),
+    doOcr: bool = Form(default=True),
+    doBarcode: bool = Form(default=True),
+    ocrLang: str = Form(default="eng"),
+    ocrPsm: int = Form(default=6),
+    k: int = Form(default=5),
+    status: str = Form(default="released"),
+    authorization: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
+):
+    """
+    Top-K matching against stored items using CLIP cosine similarity.
+    Adds explainability signals from:
+      - OCR token overlap (queryText vs item.ocrText)
+      - Barcode intersection (query image scan vs item barcodes)
+    """
+    require_auth(authorization)
+    model, processor = load_model()
+    request_id = _request_id_from_header(x_request_id)
+
+    upload = file or image
+    if upload is None:
+        raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
+    pil_image = await _upload_to_pil(upload)
+
+    # Query embedding
+    inputs = processor(images=pil_image, return_tensors="pt")
+    with torch.no_grad():
+        q_emb_t = model.get_image_features(**inputs)
+    q_emb = _normalize_embedding(q_emb_t).squeeze().tolist()
+
+    # Optional query OCR / Barcode signals
+    q_ocr = None
+    if doOcr:
+        try:
+            q_ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
+            store.add_audit_log(
+                event_type="OCR_EXTRACT",
+                request_id=request_id,
+                payload={"scope": "query", "meta": q_ocr.get("meta"), "wordCount": len(q_ocr.get("words") or []), "fullText": q_ocr.get("fullText")},
+            )
+        except Exception as e:
+            store.add_audit_log(
+                event_type="OCR_EXTRACT_FAILED",
+                request_id=request_id,
+                payload={"scope": "query", "error": str(e), "ocrLang": ocrLang, "ocrPsm": int(ocrPsm)},
+            )
+
+    q_barcode = None
+    if doBarcode:
+        try:
+            q_barcode = scan_barcodes(pil_image)
+            store.add_audit_log(
+                event_type="BARCODE_SCAN",
+                request_id=request_id,
+                payload={"scope": "query", "barcodes": q_barcode.get("barcodes"), "meta": q_barcode.get("meta")},
+            )
+        except Exception as e:
+            store.add_audit_log(event_type="BARCODE_SCAN_FAILED", request_id=request_id, payload={"scope": "query", "error": str(e)})
+
+    # Candidate items
+    k = max(1, min(int(k), 50))
+    candidates = store.list_item_embeddings(status=status, limit=5000)
+
+    scored = []
+    for it in candidates:
+        s = cosine_similarity(q_emb, it.get("embedding") or [])
+        scored.append((s, it))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    top = scored[:k]
+
+    sims = [float(s) for s, _ in top]
+    confs = softmax_confidences(sims)
+
+    results = []
+    for (s, it), conf in zip(top, confs):
+        expl = build_explanation(
+            similarity=float(s),
+            query_text=(queryText or (q_ocr or {}).get("fullText")),
+            item_ocr_text=it.get("ocrText"),
+            query_barcodes=(q_barcode or {}).get("barcodes"),
+            item_barcodes=it.get("barcodes"),
+        )
+        results.append(
+            {
+                "item": {
+                    "id": it.get("id"),
+                    "name": it.get("name"),
+                    "description": it.get("description"),
+                    "status": it.get("status"),
+                    "ocrText": it.get("ocrText"),
+                    "barcodes": it.get("barcodes") or [],
+                },
+                "score": float(s),
+                "confidence": float(conf),
+                "explanation": expl,
+            }
+        )
+
+    store.add_audit_log(
+        event_type="AI_MATCH_GENERATION",
+        request_id=request_id,
+        payload={"k": k, "statusFilter": status, "queryText": (queryText or None), "resultIds": [r["item"]["id"] for r in results]},
+    )
+
+    return {
+        "requestId": request_id,
+        "query": {
+            "embedding": q_emb,
+            "queryText": queryText,
+            "ocr": q_ocr,
+            "barcode": q_barcode,
+        },
+        "topK": results,
+    }
