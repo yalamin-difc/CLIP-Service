@@ -38,6 +38,30 @@ def softmax_confidences(scores: List[float], *, temperature: float = 0.07) -> Li
     return [e / z for e in exps]
 
 
+def should_return_no_match(
+    *,
+    top_score: float,
+    second_score: Optional[float],
+    min_score: float,
+    min_margin: float,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Government-style decisioning often requires explicit 'no match' outputs.
+    This implements simple, configurable guardrails:
+      - top_score must exceed min_score
+      - (top_score - second_score) must exceed min_margin (if second exists)
+    """
+    ts = float(top_score)
+    ss = float(second_score) if second_score is not None else None
+    ms = float(min_score)
+    mm = float(min_margin)
+    if ts < ms:
+        return True, {"reason": "LOW_TOP_SCORE", "topScore": ts, "minScore": ms}
+    if ss is not None and (ts - ss) < mm:
+        return True, {"reason": "LOW_MARGIN", "topScore": ts, "secondScore": ss, "minMargin": mm}
+    return False, {"reason": "OK", "topScore": ts, "secondScore": ss, "minScore": ms, "minMargin": mm}
+
+
 def _tokens(s: Optional[str]) -> List[str]:
     if not s:
         return []

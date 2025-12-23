@@ -5,7 +5,14 @@ FROM python:3.10-slim
 ENV PYTHONUNBUFFERED True
 
 # Install system deps (git for CLIP, tesseract for OCR)
-RUN apt-get update && apt-get install -y git tesseract-ocr tesseract-ocr-eng && rm -rf /var/lib/apt/lists/*
+# Add language packs for multilingual OCR (English/Arabic/French).
+RUN apt-get update && apt-get install -y \
+  git \
+  tesseract-ocr \
+  tesseract-ocr-eng \
+  tesseract-ocr-ara \
+  tesseract-ocr-fra \
+  && rm -rf /var/lib/apt/lists/*
 
 # Set work dir
 WORKDIR /app

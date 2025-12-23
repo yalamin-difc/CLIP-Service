@@ -4,6 +4,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.responses import Response
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import torch
@@ -11,10 +12,21 @@ import io
 import uuid
 from datetime import datetime, timezone
 
+import hashlib
+import json
+import time
+
 from barcode_service import scan_barcodes
-from match_service import build_explanation, cosine_similarity, softmax_confidences
+from match_service import build_explanation, cosine_similarity, should_return_no_match, softmax_confidences
 from ocr_service import extract_ocr
 from storage import SqliteStore
+
+try:
+    from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+except Exception:  # pragma: no cover
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+    Counter = Gauge = Histogram = None
+    generate_latest = None
 
 app = FastAPI(title="CLIP Service")
 
@@ -49,7 +61,34 @@ import os
 CLIP_API_KEY = os.environ.get("CLIP_API_KEY", "").strip()
 DB_PATH = os.environ.get("DB_PATH", "/tmp/clip_service.sqlite").strip() or "/tmp/clip_service.sqlite"
 
+# Confidence calibration / decisioning controls (env-configurable)
+CONF_TEMPERATURE = float(os.environ.get("CONF_TEMPERATURE", "0.07"))
+CONF_MIN_SCORE = float(os.environ.get("CONF_MIN_SCORE", "0.22"))
+CONF_MIN_MARGIN = float(os.environ.get("CONF_MIN_MARGIN", "0.03"))
+
+# Service/model governance metadata (env-configurable)
+SERVICE_VERSION = os.environ.get("SERVICE_VERSION", "dev").strip() or "dev"
+MODEL_ID = os.environ.get("MODEL_ID", "openai/clip-vit-base-patch32").strip() or "openai/clip-vit-base-patch32"
+
 store = SqliteStore(DB_PATH)
+
+# ---------------------------------------------------------
+# Metrics (Prometheus)
+# ---------------------------------------------------------
+if Counter is not None:
+    METRIC_REQUESTS = Counter("clip_service_requests_total", "Requests", ["endpoint", "status"])
+    METRIC_LATENCY = Histogram("clip_service_request_latency_seconds", "Request latency", ["endpoint"])
+    METRIC_MODEL_LOADED = Gauge("clip_service_model_loaded", "Model loaded (1/0)")
+    METRIC_OCR_OK = Counter("clip_service_ocr_ok_total", "OCR successes", ["lang"])
+    METRIC_OCR_FAIL = Counter("clip_service_ocr_fail_total", "OCR failures", ["lang"])
+    METRIC_BARCODE_OK = Counter("clip_service_barcode_ok_total", "Barcode scan successes")
+    METRIC_BARCODE_FAIL = Counter("clip_service_barcode_fail_total", "Barcode scan failures")
+    METRIC_MATCH_NO_MATCH = Counter("clip_service_match_no_match_total", "No-match decisions")
+else:
+    METRIC_REQUESTS = METRIC_LATENCY = METRIC_MODEL_LOADED = None
+    METRIC_OCR_OK = METRIC_OCR_FAIL = None
+    METRIC_BARCODE_OK = METRIC_BARCODE_FAIL = None
+    METRIC_MATCH_NO_MATCH = None
 
 
 def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
@@ -68,10 +107,19 @@ def load_model():
     global model, processor
     if model is None:
         print("⏳ Loading CLIP model on demand...")
-        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        model = CLIPModel.from_pretrained(MODEL_ID)
+        processor = CLIPProcessor.from_pretrained(MODEL_ID)
         print("✅ CLIP model ready!")
     return model, processor
+
+
+@app.get("/metrics")
+def metrics():
+    if generate_latest is None:
+        raise HTTPException(status_code=503, detail="Metrics not available (prometheus-client not installed)")
+    if METRIC_MODEL_LOADED is not None:
+        METRIC_MODEL_LOADED.set(1 if model is not None else 0)
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -83,6 +131,25 @@ async def _upload_to_pil(upload: UploadFile) -> Image.Image:
         return Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail="Invalid image upload") from e
+
+
+async def _read_upload_bytes(upload: UploadFile) -> bytes:
+    try:
+        return await upload.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Failed to read upload") from e
+
+
+def _sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _governance_meta() -> dict:
+    return {
+        "serviceVersion": SERVICE_VERSION,
+        "modelId": MODEL_ID,
+        "confidence": {"temperature": CONF_TEMPERATURE, "minScore": CONF_MIN_SCORE, "minMargin": CONF_MIN_MARGIN},
+    }
 
 
 def _normalize_embedding(emb: torch.Tensor) -> torch.Tensor:
@@ -472,15 +539,22 @@ async def analyze_image(
       - OCR (Tesseract)
       - Barcode scan (ZXing)
     """
+    t0 = time.time()
+    endpoint = "/analyze-image"
     require_auth(authorization)
     model, processor = load_model()
 
     upload = file or image
     if upload is None:
+        if METRIC_REQUESTS is not None:
+            METRIC_REQUESTS.labels(endpoint=endpoint, status="400").inc()
         raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
     request_id = _request_id_from_header(x_request_id)
 
-    pil_image = await _upload_to_pil(upload)
+    raw = await _read_upload_bytes(upload)
+    pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
+    input_hash = _sha256_hex(raw)
+    input_meta = {"sha256": input_hash, "bytes": len(raw), "contentType": upload.content_type}
 
     # CLIP
     inputs = processor(images=pil_image, return_tensors="pt")
@@ -494,6 +568,8 @@ async def analyze_image(
     if doOcr:
         try:
             ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
+            if METRIC_OCR_OK is not None:
+                METRIC_OCR_OK.labels(lang=str(ocrLang)).inc()
             store.add_audit_log(
                 event_type="OCR_EXTRACT",
                 request_id=request_id,
@@ -501,6 +577,8 @@ async def analyze_image(
             )
         except Exception as e:
             ocr_error = str(e)
+            if METRIC_OCR_FAIL is not None:
+                METRIC_OCR_FAIL.labels(lang=str(ocrLang)).inc()
             store.add_audit_log(
                 event_type="OCR_EXTRACT_FAILED",
                 request_id=request_id,
@@ -512,6 +590,8 @@ async def analyze_image(
     if doBarcode:
         try:
             barcode = scan_barcodes(pil_image)
+            if METRIC_BARCODE_OK is not None:
+                METRIC_BARCODE_OK.inc()
             store.add_audit_log(
                 event_type="BARCODE_SCAN",
                 request_id=request_id,
@@ -519,14 +599,29 @@ async def analyze_image(
             )
         except Exception as e:
             barcode_error = str(e)
+            if METRIC_BARCODE_FAIL is not None:
+                METRIC_BARCODE_FAIL.inc()
             store.add_audit_log(
                 event_type="BARCODE_SCAN_FAILED",
                 request_id=request_id,
                 payload={"error": barcode_error},
             )
 
+    store.add_audit_log(
+        event_type="IMAGE_ANALYZE",
+        request_id=request_id,
+        payload={"input": input_meta, "governance": _governance_meta()},
+    )
+
+    if METRIC_LATENCY is not None:
+        METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - t0))
+    if METRIC_REQUESTS is not None:
+        METRIC_REQUESTS.labels(endpoint=endpoint, status="200").inc()
+
     return {
         "requestId": request_id,
+        "governance": _governance_meta(),
+        "input": input_meta,
         "embedding": embedding,
         "ocr": ocr,
         "ocrError": ocr_error,
@@ -549,15 +644,21 @@ async def create_item(
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
 ):
     """Create an item, storing CLIP embedding + optional OCR + barcode results."""
+    t0 = time.time()
+    endpoint = "/items:create"
     require_auth(authorization)
     model, processor = load_model()
 
     upload = file or image
     if upload is None:
+        if METRIC_REQUESTS is not None:
+            METRIC_REQUESTS.labels(endpoint=endpoint, status="400").inc()
         raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
     request_id = _request_id_from_header(x_request_id)
 
-    pil_image = await _upload_to_pil(upload)
+    raw = await _read_upload_bytes(upload)
+    pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
+    input_hash = _sha256_hex(raw)
 
     # CLIP
     inputs = processor(images=pil_image, return_tensors="pt")
@@ -571,9 +672,13 @@ async def create_item(
     if doOcr:
         try:
             ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
+            if METRIC_OCR_OK is not None:
+                METRIC_OCR_OK.labels(lang=str(ocrLang)).inc()
             ocr_text = ocr.get("fullText")
             ocr_words = ocr.get("words")
         except Exception as e:
+            if METRIC_OCR_FAIL is not None:
+                METRIC_OCR_FAIL.labels(lang=str(ocrLang)).inc()
             store.add_audit_log(
                 event_type="OCR_EXTRACT_FAILED",
                 request_id=request_id,
@@ -584,8 +689,12 @@ async def create_item(
     if doBarcode:
         try:
             barcode = scan_barcodes(pil_image)
+            if METRIC_BARCODE_OK is not None:
+                METRIC_BARCODE_OK.inc()
             barcodes = barcode.get("barcodes")
         except Exception as e:
+            if METRIC_BARCODE_FAIL is not None:
+                METRIC_BARCODE_FAIL.inc()
             store.add_audit_log(event_type="BARCODE_SCAN_FAILED", request_id=request_id, payload={"error": str(e)})
 
     item = store.create_item(
@@ -602,7 +711,13 @@ async def create_item(
         event_type="ITEM_CREATED",
         item_id=item["id"],
         request_id=request_id,
-        payload={"name": item["name"], "description": item["description"], "status": item["status"]},
+        payload={
+            "name": item["name"],
+            "description": item["description"],
+            "status": item["status"],
+            "input": {"sha256": input_hash, "bytes": len(raw), "contentType": upload.content_type},
+            "governance": _governance_meta(),
+        },
     )
     if ocr_text is not None:
         store.add_audit_log(
@@ -619,7 +734,12 @@ async def create_item(
             payload={"barcodes": barcodes},
         )
 
-    return {"requestId": request_id, "item": item}
+    if METRIC_LATENCY is not None:
+        METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - t0))
+    if METRIC_REQUESTS is not None:
+        METRIC_REQUESTS.labels(endpoint=endpoint, status="200").inc()
+
+    return {"requestId": request_id, "governance": _governance_meta(), "item": item}
 
 
 @app.get("/items")
@@ -697,14 +817,20 @@ async def match_top_k(
       - OCR token overlap (queryText vs item.ocrText)
       - Barcode intersection (query image scan vs item barcodes)
     """
+    t0 = time.time()
+    endpoint = "/match"
     require_auth(authorization)
     model, processor = load_model()
     request_id = _request_id_from_header(x_request_id)
 
     upload = file or image
     if upload is None:
+        if METRIC_REQUESTS is not None:
+            METRIC_REQUESTS.labels(endpoint=endpoint, status="400").inc()
         raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
-    pil_image = await _upload_to_pil(upload)
+    raw = await _read_upload_bytes(upload)
+    pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
+    input_hash = _sha256_hex(raw)
 
     # Query embedding
     inputs = processor(images=pil_image, return_tensors="pt")
@@ -717,12 +843,16 @@ async def match_top_k(
     if doOcr:
         try:
             q_ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
+            if METRIC_OCR_OK is not None:
+                METRIC_OCR_OK.labels(lang=str(ocrLang)).inc()
             store.add_audit_log(
                 event_type="OCR_EXTRACT",
                 request_id=request_id,
                 payload={"scope": "query", "meta": q_ocr.get("meta"), "wordCount": len(q_ocr.get("words") or []), "fullText": q_ocr.get("fullText")},
             )
         except Exception as e:
+            if METRIC_OCR_FAIL is not None:
+                METRIC_OCR_FAIL.labels(lang=str(ocrLang)).inc()
             store.add_audit_log(
                 event_type="OCR_EXTRACT_FAILED",
                 request_id=request_id,
@@ -733,12 +863,16 @@ async def match_top_k(
     if doBarcode:
         try:
             q_barcode = scan_barcodes(pil_image)
+            if METRIC_BARCODE_OK is not None:
+                METRIC_BARCODE_OK.inc()
             store.add_audit_log(
                 event_type="BARCODE_SCAN",
                 request_id=request_id,
                 payload={"scope": "query", "barcodes": q_barcode.get("barcodes"), "meta": q_barcode.get("meta")},
             )
         except Exception as e:
+            if METRIC_BARCODE_FAIL is not None:
+                METRIC_BARCODE_FAIL.inc()
             store.add_audit_log(event_type="BARCODE_SCAN_FAILED", request_id=request_id, payload={"scope": "query", "error": str(e)})
 
     # Candidate items
@@ -753,7 +887,19 @@ async def match_top_k(
     top = scored[:k]
 
     sims = [float(s) for s, _ in top]
-    confs = softmax_confidences(sims)
+    confs = softmax_confidences(sims, temperature=CONF_TEMPERATURE)
+
+    # No-match decisioning
+    top_score = sims[0] if sims else 0.0
+    second_score = sims[1] if len(sims) > 1 else None
+    no_match, no_match_meta = should_return_no_match(
+        top_score=top_score,
+        second_score=second_score,
+        min_score=CONF_MIN_SCORE,
+        min_margin=CONF_MIN_MARGIN,
+    )
+    if no_match and METRIC_MATCH_NO_MATCH is not None:
+        METRIC_MATCH_NO_MATCH.inc()
 
     results = []
     for (s, it), conf in zip(top, confs):
@@ -783,16 +929,31 @@ async def match_top_k(
     store.add_audit_log(
         event_type="AI_MATCH_GENERATION",
         request_id=request_id,
-        payload={"k": k, "statusFilter": status, "queryText": (queryText or None), "resultIds": [r["item"]["id"] for r in results]},
+        payload={
+            "k": k,
+            "statusFilter": status,
+            "queryText": (queryText or None),
+            "resultIds": [r["item"]["id"] for r in results],
+            "input": {"sha256": input_hash, "bytes": len(raw), "contentType": upload.content_type},
+            "decisioning": {"noMatch": no_match, "meta": no_match_meta},
+            "governance": _governance_meta(),
+        },
     )
+
+    if METRIC_LATENCY is not None:
+        METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - t0))
+    if METRIC_REQUESTS is not None:
+        METRIC_REQUESTS.labels(endpoint=endpoint, status="200").inc()
 
     return {
         "requestId": request_id,
+        "governance": _governance_meta(),
+        "decisioning": {"noMatch": no_match, "meta": no_match_meta},
         "query": {
             "embedding": q_emb,
             "queryText": queryText,
             "ocr": q_ocr,
             "barcode": q_barcode,
         },
-        "topK": results,
+        "topK": ([] if no_match else results),
     }
