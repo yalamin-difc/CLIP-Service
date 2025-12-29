@@ -167,6 +167,19 @@ def _request_id_from_header(h: Optional[str]) -> str:
 def home():
     return {"status": "running", "model_loaded": model is not None}
 
+
+@app.get("/health")
+def health():
+    """
+    Lightweight health probe.
+
+    Notes:
+    - Does NOT force model load (keeps probe fast).
+    - Mirrors the root `/` health semantics for compatibility with common
+      load balancer / uptime check expectations.
+    """
+    return {"status": "running", "model_loaded": model is not None}
+
 UI_HTML = r"""<!doctype html>
 <html lang="en">
   <head>
