@@ -167,6 +167,19 @@ def _request_id_from_header(h: Optional[str]) -> str:
 def home():
     return {"status": "running", "model_loaded": model is not None}
 
+
+@app.get("/health")
+def health():
+    """
+    Lightweight health probe.
+
+    Notes:
+    - Does NOT force model load (keeps probe fast).
+    - Mirrors the root `/` health semantics for compatibility with common
+      load balancer / uptime check expectations.
+    """
+    return {"status": "running", "model_loaded": model is not None}
+
 UI_HTML = r"""<!doctype html>
 <html lang="en">
   <head>
@@ -282,6 +295,65 @@ UI_HTML = r"""<!doctype html>
             <div class="mt-4 rounded-xl bg-slate-950/60 border border-slate-800 p-4">
               <div class="text-xs text-slate-400">Similarity</div>
               <div id="simScore" class="mt-1 text-2xl font-semibold">—</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Analyze Image (CLIP + OCR + Barcode) -->
+      <section class="mt-6 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+        <div class="flex items-end justify-between gap-4">
+          <div>
+            <h2 class="text-lg font-semibold">Analyze Image (CLIP + OCR + Barcode)</h2>
+            <p class="text-sm text-slate-400 mt-1">One-shot endpoint that returns embedding + OCR text + barcode scan.</p>
+          </div>
+          <div class="text-xs text-slate-400">Endpoint: <span class="font-mono">/analyze-image</span></div>
+        </div>
+
+        <div class="mt-4 grid md:grid-cols-3 gap-4 items-start">
+          <div class="md:col-span-1">
+            <label class="text-sm text-slate-300">Image</label>
+            <input id="anFile" type="file" accept="image/*" class="mt-2 block w-full text-sm text-slate-300 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-800 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-slate-100 hover:file:bg-slate-700" />
+            <div class="mt-3 w-full h-36 rounded-xl border border-slate-800 bg-slate-950/40 overflow-hidden flex items-center justify-center">
+              <img id="anPrev" alt="" class="hidden w-full h-full object-cover" />
+              <div id="anEmpty" class="text-xs text-slate-500">preview</div>
+            </div>
+          </div>
+
+          <div class="md:col-span-1">
+            <div class="flex items-center justify-between gap-3">
+              <label class="text-sm text-slate-300">Options</label>
+              <div class="text-xs text-slate-500">OCR requires Tesseract on server</div>
+            </div>
+            <div class="mt-3 space-y-3">
+              <label class="flex items-center gap-2 text-sm text-slate-300">
+                <input id="anDoOcr" type="checkbox" checked class="accent-indigo-500" />
+                <span>OCR</span>
+              </label>
+              <label class="flex items-center gap-2 text-sm text-slate-300">
+                <input id="anDoBarcode" type="checkbox" checked class="accent-indigo-500" />
+                <span>Barcode</span>
+              </label>
+
+              <div class="grid grid-cols-2 gap-3">
+                <div>
+                  <label class="text-xs text-slate-400">ocrLang</label>
+                  <input id="anOcrLang" value="eng" class="mt-1 w-full rounded-xl bg-slate-950/60 border border-slate-800 p-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                </div>
+                <div>
+                  <label class="text-xs text-slate-400">ocrPsm</label>
+                  <input id="anOcrPsm" value="6" inputmode="numeric" class="mt-1 w-full rounded-xl bg-slate-950/60 border border-slate-800 p-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="md:col-span-1 md:pt-6">
+            <button id="btnAnalyze" class="w-full rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-sm font-semibold">Analyze</button>
+            <div id="anStatus" class="mt-3 text-sm text-slate-400"></div>
+            <div class="mt-4">
+              <div class="text-xs text-slate-400 mb-2">Result</div>
+              <pre id="anOut" class="text-xs whitespace-pre-wrap break-words rounded-xl bg-slate-950/60 border border-slate-800 p-3 min-h-[160px]"></pre>
             </div>
           </div>
         </div>
@@ -419,6 +491,65 @@ UI_HTML = r"""<!doctype html>
           const body = await r.json().catch(() => ({}));
           if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
           scoreEl.textContent = Number(body.similarity).toFixed(6);
+          status.textContent = "Done.";
+        } catch (e) {
+          status.textContent = `Error: ${e.message}`;
+        }
+      });
+
+      // Analyze Image (CLIP + OCR + Barcode)
+      const anFile = document.getElementById("anFile");
+      anFile.addEventListener("change", () => previewFile(anFile, document.getElementById("anPrev"), document.getElementById("anEmpty")));
+
+      document.getElementById("btnAnalyze").addEventListener("click", async () => {
+        const status = document.getElementById("anStatus");
+        const out = document.getElementById("anOut");
+        out.textContent = "";
+
+        const f = anFile.files && anFile.files[0];
+        if (!f) { status.textContent = "Choose an image first."; return; }
+
+        const doOcr = !!document.getElementById("anDoOcr").checked;
+        const doBarcode = !!document.getElementById("anDoBarcode").checked;
+        const ocrLang = (document.getElementById("anOcrLang").value || "eng").trim() || "eng";
+        const ocrPsm = (document.getElementById("anOcrPsm").value || "6").trim() || "6";
+
+        status.textContent = "Analyzing...";
+        try {
+          const fd = new FormData();
+          fd.append("file", f);
+          fd.append("doOcr", String(doOcr));
+          fd.append("doBarcode", String(doBarcode));
+          fd.append("ocrLang", ocrLang);
+          fd.append("ocrPsm", ocrPsm);
+
+          const r = await fetch(`${base}/analyze-image`, { method: "POST", body: fd, headers: authHeader() });
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
+
+          const ocrText = body?.ocr?.fullText || null;
+          const ocrWords = (body?.ocr?.words || []);
+          const barcodes = (body?.barcode?.barcodes || []);
+
+          out.textContent = fmt({
+            requestId: body.requestId,
+            embedding: clipVec(body.embedding),
+            ocr: {
+              enabled: doOcr,
+              fullText: ocrText,
+              wordCount: Array.isArray(ocrWords) ? ocrWords.length : 0,
+              error: body.ocrError || null,
+              meta: body?.ocr?.meta || null,
+            },
+            barcode: {
+              enabled: doBarcode,
+              barcodes,
+              error: body.barcodeError || null,
+              meta: body?.barcode?.meta || null,
+            },
+            governance: body.governance || null,
+          });
+
           status.textContent = "Done.";
         } catch (e) {
           status.textContent = `Error: ${e.message}`;
