@@ -1,0 +1,16 @@
+const axios = require("axios");
+const FormData = require("form-data");
+const fs = require("fs");
+
+const CLIP_URL = process.env.CLIP_URL || "http://localhost:5001";
+
+async function getEmbedding(imagePath) {
+  const form = new FormData();
+  form.append("file", fs.createReadStream(imagePath));
+  const res = await axios.post(`${CLIP_URL}/encode-image`, form, {
+    headers: form.getHeaders(),
+  });
+  return res.data.embedding;
+}
+
+module.exports = { getEmbedding };

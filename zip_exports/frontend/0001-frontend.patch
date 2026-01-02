@@ -1,0 +1,135 @@
+From 16d5a1e652ca4d03b20c35c631548fe37b25e7fe Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Jan 2026 08:27:36 +0000
+Subject: [PATCH] fix: wire PII reveal and normalize ClipVisualizer filename
+
+---
+ ...lipVisualizer.js %20 => ClipVisualizer.js} | 23 +++++++------------
+ src/pages/ItemDetail.js                       | 21 ++++++++++++-----
+ 2 files changed, 23 insertions(+), 21 deletions(-)
+ rename src/components/{ClipVisualizer.js %20 => ClipVisualizer.js} (81%)
+
+diff --git a/src/components/ClipVisualizer.js %20 b/src/components/ClipVisualizer.js
+similarity index 81%
+rename from src/components/ClipVisualizer.js %20
+rename to src/components/ClipVisualizer.js
+index a5afaf421..7e5b4eb44 100644
+--- a/src/components/ClipVisualizer.js %20	
++++ b/src/components/ClipVisualizer.js
+@@ -26,19 +26,16 @@ const ClipVisualizer = () => {
+     try {
+       const data = await aiAPI.analyze(file, text);
+       if (!data?.success) {
+-        throw new Error(data?.message || 'Analysis failed');
++        throw new Error(data?.message || "Analysis failed");
+       }
+ 
+       setResult({
+-        similarity: typeof data.similarity === 'number' ? data.similarity : 0,
+-        imageEmbedding: Array.isArray(data.imageEmbedding)
+-          ? data.imageEmbedding.slice(0, 8)
+-          : [],
+-        textEmbedding: Array.isArray(data.textEmbedding)
+-          ? data.textEmbedding.slice(0, 8)
+-          : [],
++        similarity: typeof data.similarity === "number" ? data.similarity : 0,
++        imageEmbedding: Array.isArray(data.imageEmbedding) ? data.imageEmbedding.slice(0, 8) : [],
++        textEmbedding: Array.isArray(data.textEmbedding) ? data.textEmbedding.slice(0, 8) : [],
+       });
+     } catch (err) {
++      // eslint-disable-next-line no-console
+       console.error("CLIP analyze error:", err);
+       alert("Failed to analyse request");
+     } finally {
+@@ -67,12 +64,7 @@ const ClipVisualizer = () => {
+             onChange={(e) => setText(e.target.value)}
+           />
+ 
+-          <Button
+-            variant="contained"
+-            color="primary"
+-            onClick={handleAnalyze}
+-            disabled={loading}
+-          >
++          <Button variant="contained" color="primary" onClick={handleAnalyze} disabled={loading}>
+             {loading ? <CircularProgress size={24} /> : "Analyze with CLIP"}
+           </Button>
+         </Box>
+@@ -97,4 +89,5 @@ const ClipVisualizer = () => {
+   );
+ };
+ 
+-export default ClipVisualizer;
+\ No newline at end of file
++export default ClipVisualizer;
++
+diff --git a/src/pages/ItemDetail.js b/src/pages/ItemDetail.js
+index 6e717c21c..b23fb9d58 100644
+--- a/src/pages/ItemDetail.js
++++ b/src/pages/ItemDetail.js
+@@ -12,7 +12,7 @@ import {
+   Divider,
+   TextField,
+ } from "@mui/material";
+-import { itemsAPI } from "../services/api";
++import { itemsAPI, piiAPI } from "../services/api";
+ import { UPLOAD_URL } from "../utils/constants";
+ import { useAuth } from "../contexts/AuthContext";
+ import ChatThread from "../components/ChatThread";
+@@ -31,6 +31,7 @@ const ItemDetails = () => {
+   const [savingShipment, setSavingShipment] = useState(false);
+   const [shipmentStatus, setShipmentStatus] = useState({ type: "", text: "" });
+   const { user, isAuthenticated, hasRole, hasPermission } = useAuth();
++  const [revealedContact, setRevealedContact] = useState(null);
+ 
+   const isOwner = useMemo(() => {
+     const uid = user?._id || user?.id;
+@@ -110,6 +111,7 @@ const ItemDetails = () => {
+     : null;
+ 
+   const reporterPhone =
++    revealedContact?.phone ||
+     contactInfo?.phone ||
+     item?.reporter?.phone ||
+     item?.reporter?.mobile ||
+@@ -117,7 +119,7 @@ const ItemDetails = () => {
+     "";
+ 
+   const reporterName = item?.reporter?.username || item?.reporter?.name || "";
+-  const reporterEmail = item?.reporter?.email || contactInfo?.email || "";
++  const reporterEmail = revealedContact?.email || item?.reporter?.email || contactInfo?.email || "";
+ 
+   const canRevealPii = Boolean(
+     isOwner ||
+@@ -318,9 +320,12 @@ const ItemDetails = () => {
+                   maskedValue={t("pii.hidden")}
+                   canReveal={canRevealPii}
+                   onReveal={async ({ reason }) => {
+-                    // Backend must enforce + audit
+-                    // await api.post("/audit/pii-reveal", { itemId: id, field: "reporterName", reason })
+-                    console.info("PII reveal requested", { itemId: id, field: "reporterName", reason });
++                    // Backend enforces + audits (break-glass reveal)
++                    const res = await piiAPI.reveal({ caseId: id, itemId: id, reason });
++                    const contact = res?.data?.contact || res?.contact || null;
++                    if (contact && typeof contact === "object") {
++                      setRevealedContact((prev) => ({ ...(prev || {}), ...contact }));
++                    }
+                   }}
+                 />
+                 <PiiField
+@@ -329,7 +334,11 @@ const ItemDetails = () => {
+                   maskedValue={t("pii.hidden")}
+                   canReveal={canRevealPii}
+                   onReveal={async ({ reason }) => {
+-                    console.info("PII reveal requested", { itemId: id, field: "reporterEmail", reason });
++                    const res = await piiAPI.reveal({ caseId: id, itemId: id, reason });
++                    const contact = res?.data?.contact || res?.contact || null;
++                    if (contact && typeof contact === "object") {
++                      setRevealedContact((prev) => ({ ...(prev || {}), ...contact }));
++                    }
+                   }}
+                 />
+               </>
+-- 
+2.43.0
+
