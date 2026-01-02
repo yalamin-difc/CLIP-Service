@@ -1,0 +1,874 @@
+From ee6504dd27fdf4e1c72c8f413ef4495cc8f57441 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 2 Jan 2026 08:27:58 +0000
+Subject: [PATCH] feat: complete end-to-end workflow integration
+
+- Align claims/appointments/chat response shapes with frontend
+- Add item shipment + clientReference persistence
+- Enforce break-glass PII reveal and reduce PII leakage
+- Add optional OCR/barcode capture via CLIP-Service analyze-image
+- Add mock UAE Pass flow (UAEPASS_MOCK_ENABLED)
+---
+ controllers/authController.js | 109 ++++++++++++++++++++++++++++------
+ middleware/auth.js            |  22 ++++++-
+ models/appointment.js         |   5 ++
+ models/claim.js               |   8 +++
+ models/item.js                |  18 ++++++
+ models/user.js                |   3 +
+ routes/ai.js                  |   5 +-
+ routes/appointments.js        |  37 ++++++++++--
+ routes/chat.js                |  11 +++-
+ routes/claims.js              |  32 +++++++++-
+ routes/items.js               | 100 +++++++++++++++++++++++++------
+ routes/shipments.js           |  21 ++++++-
+ server.js                     |  31 ++++++++++
+ utils/clipClient.js           |  33 +++++++++-
+ 14 files changed, 383 insertions(+), 52 deletions(-)
+
+diff --git a/controllers/authController.js b/controllers/authController.js
+index e615d80..9491046 100644
+--- a/controllers/authController.js
++++ b/controllers/authController.js
+@@ -11,6 +11,21 @@ function signToken(id) {
+   );
+ }
+ 
++function signTokenWithClaims(user) {
++  // Include minimal claims the frontend uses for gating (role + identity).
++  // Backend MUST still enforce authz regardless of these UI hints.
++  return jwt.sign(
++    {
++      id: user.id,
++      role: user.role || 'user',
++      identityProvider: user.identityProvider || 'password',
++      identityVerified: Boolean(user.identityVerified),
++    },
++    process.env.JWT_SECRET,
++    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
++  );
++}
++
+ exports.register = async (req, res, next) => {
+   try {
+     const errors = validationResult(req);
+@@ -19,13 +34,20 @@ exports.register = async (req, res, next) => {
+ 
+     const { username, email, password, phone } = req.body;
+ 
+-    const user = await User.create({ username, email, password, phone });
++    const user = await User.create({
++      username,
++      email,
++      password,
++      phone,
++      identityProvider: 'password',
++      identityVerified: false,
++    });
+ 
+     // 🔔 Send welcome email asynchronously (don’t block response)
+     sendWelcomeEmail({ username, email })
+       .catch(err => console.error('❌ Failed to send welcome email:', err));
+ 
+-    const token = signToken(user.id);
++    const token = signTokenWithClaims(user);
+     res.status(201).json({
+       success: true,
+       token,
+@@ -52,7 +74,7 @@ exports.login = async (req, res, next) => {
+     if (!ok)
+       return res.status(401).json({ success: false, message: 'Invalid credentials' });
+ 
+-    const token = signToken(user.id);
++    const token = signTokenWithClaims(user);
+     res.json({ success: true, token, user: user.toJSON() });
+   } catch (err) {
+     next(err);
+@@ -101,24 +123,77 @@ exports.changePassword = async (req, res) => {
+ // UAE PASS integration stubs (endpoints exist for frontend integration)
+ exports.uaePassStart = async (req, res) => {
+   const { returnTo } = req.query || {};
+-  res.json({
+-    success: true,
+-    data: {
+-      configured: false,
+-      returnTo: returnTo || null,
+-      message: 'UAE PASS is not configured on this backend yet'
+-    }
+-  });
++  const rt = (returnTo || '').toString();
++
++  // Minimal end-to-end workflow support:
++  // - If UAEPASS is not configured, allow a *mock* flow in dev via UAEPASS_MOCK_ENABLED=1
++  // - Frontend expects redirect to /uaepass/callback with either token or code.
++  const mockEnabled = String(process.env.UAEPASS_MOCK_ENABLED || '') === '1';
++  if (!mockEnabled) {
++    return res.json({
++      success: true,
++      data: {
++        configured: false,
++        returnTo: rt || null,
++        message: 'UAE PASS is not configured on this backend yet'
++      }
++    });
++  }
++
++  if (!rt) {
++    return res.status(400).json({ success: false, message: 'returnTo is required for mock UAEPASS flow' });
++  }
++
++  // Redirect with mock code (frontend will exchange it).
++  const nextUrl = new URL(rt);
++  nextUrl.searchParams.set('code', `mock_${Date.now()}`);
++  nextUrl.searchParams.set('next', '/citizen');
++  return res.redirect(nextUrl.toString());
+ };
+ 
+ exports.uaePassExchange = async (req, res) => {
+   const { code } = req.body || {};
+-  res.json({
++  const mockEnabled = String(process.env.UAEPASS_MOCK_ENABLED || '') === '1';
++
++  if (!mockEnabled) {
++    return res.json({
++      success: true,
++      data: {
++        configured: false,
++        code: code || null,
++        message: 'UAE PASS is not configured on this backend yet'
++      }
++    });
++  }
++
++  // Mock: create/find a verified user and issue a JWT containing identity claims.
++  // In production, this should validate the code with UAE Pass and map to a real identity.
++  const email = `uaepass.mock.${String(code || 'user').replace(/[^a-z0-9._-]/gi, '')}@example.com`.toLowerCase();
++  const username = `uaepass_${String(code || 'user').slice(-10)}`;
++
++  let user = await User.findOne({ email }).select('-password');
++  if (!user) {
++    // Create with a random password (not used), mark identity verified.
++    const randomPw = `mock_${Math.random().toString(36).slice(2)}_${Date.now()}`;
++    user = await User.create({
++      username,
++      email,
++      password: randomPw,
++      role: 'user',
++      identityProvider: 'uaepass',
++      identityVerified: true,
++    });
++  } else {
++    user.identityProvider = 'uaepass';
++    user.identityVerified = true;
++    await user.save();
++  }
++
++  const token = signTokenWithClaims(user);
++  return res.json({
+     success: true,
+-    data: {
+-      configured: false,
+-      code: code || null,
+-      message: 'UAE PASS is not configured on this backend yet'
+-    }
++    token,
++    user: user.toJSON ? user.toJSON() : user,
++    data: { configured: false, mock: true }
+   });
+ };
+\ No newline at end of file
+diff --git a/middleware/auth.js b/middleware/auth.js
+index b0db236..137be2c 100644
+--- a/middleware/auth.js
++++ b/middleware/auth.js
+@@ -19,6 +19,26 @@ const protect = async (req, res, next) => {
+   }
+ };
+ 
++/**
++ * Optional authentication:
++ * - If a Bearer token is present and valid, sets req.user
++ * - If no token (or invalid token), continues without failing the request
++ */
++const optionalAuth = async (req, _res, next) => {
++  try {
++    const auth = req.headers.authorization || '';
++    if (!auth || !auth.startsWith('Bearer ')) return next();
++    const token = auth.split(' ')[1];
++    const decoded = jwt.verify(token, process.env.JWT_SECRET);
++    const user = await User.findById(decoded.id).select('-password');
++    if (user) req.user = user;
++    return next();
++  } catch {
++    // ignore invalid/expired tokens for public endpoints
++    return next();
++  }
++};
++
+ /**
+  * Restrict access to specific roles.
+  * Usage: router.get("/admin", protect, restrictTo("admin"), handler)
+@@ -31,4 +51,4 @@ const restrictTo = (...roles) => (req, res, next) => {
+   next();
+ };
+ 
+-module.exports = { protect, restrictTo };
+\ No newline at end of file
++module.exports = { protect, optionalAuth, restrictTo };
+\ No newline at end of file
+diff --git a/models/appointment.js b/models/appointment.js
+index dc7c443..19a5d96 100644
+--- a/models/appointment.js
++++ b/models/appointment.js
+@@ -4,8 +4,13 @@ const appointmentSchema = new mongoose.Schema(
+   {
+     owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+     item: { type: mongoose.Schema.Types.ObjectId, ref: 'Item' }, // optional
++    claim: { type: mongoose.Schema.Types.ObjectId, ref: 'Claim' }, // optional
++    appointmentRef: { type: String, trim: true, index: true },
++    site: { type: String, trim: true },
+     scheduledAt: { type: Date, required: true },
+     location: { type: String, trim: true },
++    // Human-friendly slot string (frontend may submit/display this directly).
++    slot: { type: String, trim: true },
+     status: {
+       type: String,
+       enum: ['scheduled', 'completed', 'cancelled'],
+diff --git a/models/claim.js b/models/claim.js
+index a8db604..fa59051 100644
+--- a/models/claim.js
++++ b/models/claim.js
+@@ -4,11 +4,19 @@ const claimSchema = new mongoose.Schema(
+   {
+     owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+     item: { type: mongoose.Schema.Types.ObjectId, ref: 'Item' }, // optional
++    // External/customer-facing reference (UI shows this prominently).
++    claimReference: { type: String, trim: true, index: true },
+     status: {
+       type: String,
+       enum: ['submitted', 'in_review', 'approved', 'rejected'],
+       default: 'submitted'
+     },
++    // Claimant supplied information (used in citizen workflow).
++    claimantName: { type: String, trim: true },
++    claimantEmail: { type: String, trim: true },
++    claimantPhone: { type: String, trim: true },
++    narrative: { type: String, trim: true },
++    // Backwards-compatible/freeform notes (optional)
+     notes: { type: String, trim: true },
+     evidence: [
+       {
+diff --git a/models/item.js b/models/item.js
+index d9e1454..4f2c632 100644
+--- a/models/item.js
++++ b/models/item.js
+@@ -6,6 +6,8 @@ const itemSchema = new mongoose.Schema(
+     description: { type: String },
+     category: { type: String },
+     type: { type: String, enum: ["lost", "found"], required: true },
++    // Customer-facing reference number (generated in frontend today).
++    clientReference: { type: String, trim: true, index: true },
+     address: { type: String },
+     images: [{ type: String }],
+     location: {
+@@ -17,6 +19,13 @@ const itemSchema = new mongoose.Schema(
+       ref: "User",
+       required: true, // ensures user is linked
+     },
++    // Shipment tracking (used by ItemDetail for found items).
++    shipment: {
++      provider: { type: String, trim: true },
++      trackingNumber: { type: String, trim: true },
++      status: { type: String, trim: true },
++      updatedAt: { type: Date }
++    },
+     contactInfo: {
+       email: { type: String, trim: true },
+       phone: { type: String, trim: true },
+@@ -24,6 +33,15 @@ const itemSchema = new mongoose.Schema(
+     },
+     imageEmbedding: { type: [Number], default: [] }, // CLIP image vector
+     textEmbedding: { type: [Number], default: [] },  // CLIP text vector
++    // Optional OCR + barcode signals (from CLIP-Service /analyze-image)
++    ocrText: { type: String, trim: true },
++    barcodes: [
++      {
++        text: { type: String, trim: true },
++        format: { type: String, trim: true },
++        contentType: { type: String, trim: true }
++      }
++    ],
+     matchedItems: [
+       {
+         item: { type: mongoose.Schema.Types.ObjectId, ref: "Item" },
+diff --git a/models/user.js b/models/user.js
+index 40dcd52..e1c01d4 100644
+--- a/models/user.js
++++ b/models/user.js
+@@ -13,6 +13,9 @@ const UserSchema = new mongoose.Schema({
+   phone: { type: String, trim: true },
+   password: { type: String, required: true, minlength: 8, select: false },
+   role: { type: String, enum: ['user','admin'], default: 'user' },
++  // Identity (UAE Pass / external IdP) - used for citizen workflow gating in the UI.
++  identityProvider: { type: String, trim: true, default: 'password' }, // password | uaepass | other
++  identityVerified: { type: Boolean, default: false },
+ }, { timestamps: true });
+ 
+ UserSchema.index({ email: 1 }, { unique: true });
+diff --git a/routes/ai.js b/routes/ai.js
+index 5a87d43..2d999a5 100644
+--- a/routes/ai.js
++++ b/routes/ai.js
+@@ -78,7 +78,10 @@ async function handleCombinedMatch(req, res) {
+         imageScore,
+         textScore,
+         signals,
+-        reporter: item.reporter,
++        // Avoid leaking PII; use /api/pii/reveal for audited break-glass access.
++        reporter: item.reporter?._id
++          ? { _id: item.reporter._id, username: item.reporter.username }
++          : null,
+       })),
+     });
+   } catch (err) {
+diff --git a/routes/appointments.js b/routes/appointments.js
+index baf586c..2036bb4 100644
+--- a/routes/appointments.js
++++ b/routes/appointments.js
+@@ -11,7 +11,12 @@ router.get('/my', protect, async (req, res) => {
+       .populate('item', 'title type category images')
+       .sort({ scheduledAt: 1 })
+       .lean();
+-    res.json({ success: true, data: items });
++    res.json({
++      success: true,
++      appointments: items,
++      items,
++      data: items
++    });
+   } catch (err) {
+     res.status(500).json({ success: false, message: err.message });
+   }
+@@ -20,20 +25,40 @@ router.get('/my', protect, async (req, res) => {
+ // POST /api/appointments
+ router.post('/', protect, async (req, res) => {
+   try {
+-    const { itemId, scheduledAt, location, notes } = req.body || {};
+-    if (!scheduledAt) {
+-      return res.status(400).json({ success: false, message: 'scheduledAt is required' });
++    const { itemId, claimId, appointmentRef, site, scheduledAt, slot, time, location, notes } = req.body || {};
++
++    // Frontend sends `slot` like "YYYY-MM-DD HH:mm" (or separate date/time).
++    // Accept either `scheduledAt` (ISO) or `slot`.
++    const rawSlot = slot || time || null;
++    const rawScheduledAt = scheduledAt || null;
++    const parsedDate = rawScheduledAt
++      ? new Date(rawScheduledAt)
++      : rawSlot
++        ? new Date(String(rawSlot).replace(' ', 'T'))
++        : null;
++
++    if (!parsedDate || Number.isNaN(parsedDate.getTime())) {
++      return res.status(400).json({ success: false, message: 'scheduledAt (or slot) is required' });
+     }
+ 
+     const appt = await Appointment.create({
+       owner: req.user._id,
+       item: itemId || undefined,
+-      scheduledAt: new Date(scheduledAt),
++      claim: claimId || undefined,
++      appointmentRef: appointmentRef || undefined,
++      site: site || undefined,
++      scheduledAt: parsedDate,
+       location: location || undefined,
++      slot: rawSlot ? String(rawSlot) : undefined,
+       notes: notes || undefined
+     });
+ 
+-    res.status(201).json({ success: true, data: appt });
++    res.status(201).json({
++      success: true,
++      appointment: appt,
++      item: appt, // compatibility alias
++      data: appt
++    });
+   } catch (err) {
+     res.status(500).json({ success: false, message: err.message });
+   }
+diff --git a/routes/chat.js b/routes/chat.js
+index 7accdf5..3c90ca4 100644
+--- a/routes/chat.js
++++ b/routes/chat.js
+@@ -20,6 +20,8 @@ router.get('/items/:itemId', protect, async (req, res) => {
+ 
+     res.json({
+       success: true,
++      itemId,
++      messages,
+       data: {
+         itemId,
+         messages
+@@ -57,12 +59,17 @@ router.post('/items/:itemId/messages', protect, async (req, res) => {
+     // emit real-time update
+     try {
+       const io = req.app.get('io');
+-      io?.emit('chat:message', { itemId, message: populated });
++      const room = `item:${itemId}`;
++      io?.to?.(room)?.emit?.('chat:message', { room, itemId, message: populated });
+     } catch {
+       // ignore
+     }
+ 
+-    res.status(201).json({ success: true, data: populated });
++    res.status(201).json({
++      success: true,
++      message: populated,
++      data: populated
++    });
+   } catch (err) {
+     res.status(500).json({ success: false, message: err.message });
+   }
+diff --git a/routes/claims.js b/routes/claims.js
+index 643c6bf..a430587 100644
+--- a/routes/claims.js
++++ b/routes/claims.js
+@@ -26,6 +26,9 @@ router.get('/my', protect, async (req, res) => {
+ 
+     res.json({
+       success: true,
++      // Frontend expects `claims` or `items` in some screens.
++      claims,
++      items: claims,
+       data: claims,
+       pagination: {
+         total,
+@@ -58,7 +61,12 @@ router.get('/:claimId', protect, async (req, res) => {
+     const isAdmin = req.user?.role === 'admin';
+     if (!isOwner && !isAdmin) return res.status(403).json({ success: false, message: 'Forbidden' });
+ 
+-    res.json({ success: true, data: claim });
++    res.json({
++      success: true,
++      claim,
++      item: claim, // compatibility alias
++      data: claim
++    });
+   } catch (err) {
+     res.status(500).json({ success: false, message: err.message });
+   }
+@@ -67,7 +75,15 @@ router.get('/:claimId', protect, async (req, res) => {
+ // POST /api/claims (multipart: evidence[])
+ router.post('/', protect, uploadFiles.array('evidence', 6), async (req, res) => {
+   try {
+-    const { itemId, notes } = req.body || {};
++    const {
++      itemId,
++      claimReference,
++      claimantName,
++      claimantEmail,
++      claimantPhone,
++      narrative,
++      notes
++    } = req.body || {};
+ 
+     const evidence = (req.files || []).map((f) => ({
+       url: fileUrlFromDiskFilename(f.filename),
+@@ -78,6 +94,11 @@ router.post('/', protect, uploadFiles.array('evidence', 6), async (req, res) =>
+     const claim = await Claim.create({
+       owner: req.user._id,
+       item: itemId || undefined,
++      claimReference: claimReference || undefined,
++      claimantName: claimantName || undefined,
++      claimantEmail: claimantEmail || undefined,
++      claimantPhone: claimantPhone || undefined,
++      narrative: narrative || undefined,
+       notes: notes || undefined,
+       evidence
+     });
+@@ -91,7 +112,12 @@ router.post('/', protect, uploadFiles.array('evidence', 6), async (req, res) =>
+       metadata: { itemId: itemId || null }
+     }).catch(() => {});
+ 
+-    res.status(201).json({ success: true, data: claim });
++    res.status(201).json({
++      success: true,
++      claim,
++      item: claim, // compatibility alias
++      data: claim
++    });
+   } catch (err) {
+     res.status(500).json({ success: false, message: err.message });
+   }
+diff --git a/routes/items.js b/routes/items.js
+index b1a03c5..d2d212f 100644
+--- a/routes/items.js
++++ b/routes/items.js
+@@ -6,8 +6,8 @@ const Item = require("../models/item");
+ const AuditLog = require("../models/auditLog");
+ const upload = require("../middleware/upload");
+ const { processImage } = require("../middleware/upload");
+-const { getImageEmbedding, getTextEmbedding } = require("../utils/clipClient");
+-const { protect } = require("../middleware/auth");
++const { analyzeImage, getImageEmbedding, getTextEmbedding } = require("../utils/clipClient");
++const { protect, optionalAuth } = require("../middleware/auth");
+ const { findPotentialMatches, attachMatchesToItem } = require("../services/matchService");
+ 
+ // ===============================================
+@@ -15,7 +15,7 @@ const { findPotentialMatches, attachMatchesToItem } = require("../services/match
+ // ===============================================
+ router.post("/", protect, upload.array("images", 4), async (req, res) => {
+   try {
+-    const { title, description, category, type, address, lat, lng, contactInfo } = req.body;
++    const { title, description, category, type, clientReference, address, lat, lng, contactInfo } = req.body;
+ 
+     if (!title || !type) {
+       return res.status(400).json({
+@@ -51,14 +51,29 @@ router.post("/", protect, upload.array("images", 4), async (req, res) => {
+       }
+     }
+ 
++    // Extract image embedding + optional OCR/barcodes (via CLIP-Service analyze-image)
++    let ocrText = null;
++    let barcodes = [];
+     if (processedImages[0]) {
+-      // Save buffer to temp path for CLIP
+       const tempDir = path.join(__dirname, "..", "public", "temp");
+       if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+       const tempPath = path.join(tempDir, `${Date.now()}_clip.jpg`);
+       try {
+         fs.writeFileSync(tempPath, req.files[0].buffer);
+         imageEmbedding = await getImageEmbedding(tempPath);
++
++        const analysis = await analyzeImage(tempPath, { doOcr: true, doBarcode: true });
++        if (analysis?.ok) {
++          ocrText = analysis?.data?.ocr?.fullText || null;
++          const rawBarcodes = analysis?.data?.barcode?.barcodes || [];
++          barcodes = Array.isArray(rawBarcodes)
++            ? rawBarcodes.map((b) => ({
++                text: (b?.text || "").toString(),
++                format: (b?.format || "").toString(),
++                contentType: (b?.contentType || "").toString()
++              }))
++            : [];
++        }
+       } finally {
+         if (fs.existsSync(tempPath)) {
+           fs.unlinkSync(tempPath);
+@@ -84,6 +99,7 @@ router.post("/", protect, upload.array("images", 4), async (req, res) => {
+       description,
+       category,
+       type,
++      clientReference: clientReference || undefined,
+       address,
+       images: processedImages.map((img) => img.url),
+       location: {
+@@ -93,6 +109,8 @@ router.post("/", protect, upload.array("images", 4), async (req, res) => {
+       },
+       imageEmbedding,
+       textEmbedding,
++      ocrText: ocrText || undefined,
++      barcodes: Array.isArray(barcodes) && barcodes.length ? barcodes : [],
+       reporter: req.user?._id, // ✅ attach logged-in user
+       contactInfo: parsedContactInfo,
+     });
+@@ -125,11 +143,12 @@ router.post("/", protect, upload.array("images", 4), async (req, res) => {
+     res.status(201).json({
+       success: true,
+       item: await Item.findById(item._id)
+-        .populate("reporter", "username email")
++        // Only return minimal reporter fields on create; PII reveal is audited separately.
++        .populate("reporter", "username")
+         .populate({
+           path: "matchedItems.item",
+           select: "title images type category reporter",
+-          populate: { path: "reporter", select: "username email" },
++          populate: { path: "reporter", select: "username" },
+         }),
+       matches: sanitizedMatches,
+     });
+@@ -199,7 +218,9 @@ router.post("/ai-match", upload.single("image"), async (req, res) => {
+         imageScore,
+         textScore,
+         signals,
+-        reporter: item.reporter,
++        reporter: item.reporter?._id
++          ? { _id: item.reporter._id, username: item.reporter.username }
++          : null,
+       })),
+     });
+   } catch (err) {
+@@ -211,7 +232,7 @@ router.post("/ai-match", upload.single("image"), async (req, res) => {
+ // ===============================================
+ // 📜 Get paginated items (with reporter info & filters)
+ // ===============================================
+-router.get("/", async (req, res) => {
++router.get("/", optionalAuth, async (req, res) => {
+   try {
+     const {
+       limit = 12,
+@@ -292,9 +313,7 @@ router.get("/", async (req, res) => {
+                         $expr: { $eq: ["$_id", "$$reporterId"] },
+                       },
+                     },
+-                    {
+-                      $project: { username: 1, email: 1 },
+-                    },
++                    { $project: { username: 1 } },
+                   ],
+                   as: "reporter",
+                 },
+@@ -318,7 +337,7 @@ router.get("/", async (req, res) => {
+     } else {
+       [items, total] = await Promise.all([
+         Item.find(match)
+-          .populate("reporter", "username email")
++          .populate("reporter", "username")
+           .sort({ createdAt: -1 })
+           .skip(skip)
+           .limit(limitNum)
+@@ -327,6 +346,22 @@ router.get("/", async (req, res) => {
+       ]);
+     }
+ 
++    // Strip PII for public list views. Only the reporter themselves should see contactInfo.
++    const viewerId = req.user?._id ? String(req.user._id) : null;
++    items = (items || []).map((it) => {
++      const reporterId = it?.reporter?._id ? String(it.reporter._id) : (it?.reporter ? String(it.reporter) : null);
++      const isOwner = Boolean(viewerId && reporterId && viewerId === reporterId);
++      if (!isOwner) {
++        delete it.contactInfo;
++        if (it.reporter && typeof it.reporter === "object") {
++          delete it.reporter.email;
++          delete it.reporter.phone;
++          delete it.reporter.mobile;
++        }
++      }
++      return it;
++    });
++
+     res.json({
+       success: true,
+       items,
+@@ -374,8 +409,10 @@ router.patch("/:id", protect, async (req, res) => {
+       description,
+       category,
+       type,
++      clientReference,
+       address,
+       contactInfo,
++      shipment,
+       lat,
+       lng,
+     } = req.body || {};
+@@ -384,6 +421,7 @@ router.patch("/:id", protect, async (req, res) => {
+     if (description !== undefined) item.description = description;
+     if (category !== undefined) item.category = category;
+     if (type !== undefined) item.type = type;
++    if (clientReference !== undefined) item.clientReference = clientReference;
+     if (address !== undefined) item.address = address;
+ 
+     if (contactInfo !== undefined) {
+@@ -398,6 +436,17 @@ router.patch("/:id", protect, async (req, res) => {
+       item.contactInfo = parsed || {};
+     }
+ 
++    // Shipment tracking (used in ItemDetail for found items).
++    if (shipment !== undefined) {
++      const s = shipment && typeof shipment === "object" ? shipment : {};
++      item.shipment = {
++        provider: (s.provider || "").toString().trim() || undefined,
++        trackingNumber: (s.trackingNumber || "").toString().trim() || undefined,
++        status: (s.status || "").toString().trim() || undefined,
++        updatedAt: s.updatedAt ? new Date(s.updatedAt) : new Date(),
++      };
++    }
++
+     const latNum = lat !== undefined ? parseFloat(lat) : null;
+     const lngNum = lng !== undefined ? parseFloat(lng) : null;
+     if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
+@@ -419,11 +468,11 @@ router.patch("/:id", protect, async (req, res) => {
+     }).catch(() => {});
+ 
+     const populated = await Item.findById(item._id)
+-      .populate("reporter", "username email phone")
++      .populate("reporter", "username")
+       .populate({
+         path: "matchedItems.item",
+         select: "title images type category reporter",
+-        populate: { path: "reporter", select: "username email" },
++        populate: { path: "reporter", select: "username" },
+       });
+ 
+     res.json({ success: true, item: populated });
+@@ -436,21 +485,36 @@ router.patch("/:id", protect, async (req, res) => {
+ // ===============================================
+ // 🔍 Single item with match metadata
+ // ===============================================
+-router.get("/:id", async (req, res) => {
++router.get("/:id", optionalAuth, async (req, res) => {
+   try {
+     const item = await Item.findById(req.params.id)
+-      .populate("reporter", "username email phone")
++      .populate("reporter", "username")
+       .populate({
+         path: "matchedItems.item",
+         select: "title images type category reporter",
+-        populate: { path: "reporter", select: "username email" },
++        populate: { path: "reporter", select: "username" },
+       });
+ 
+     if (!item) {
+       return res.status(404).json({ success: false, message: "Item not found" });
+     }
+ 
+-    res.json({ success: true, item });
++    // Strip PII unless the viewer is the reporter/owner.
++    const viewerId = req.user?._id ? String(req.user._id) : null;
++    const reporterId = item?.reporter?._id ? String(item.reporter._id) : null;
++    const isOwner = Boolean(viewerId && reporterId && viewerId === reporterId);
++
++    const safe = item.toObject ? item.toObject() : item;
++    if (!isOwner) {
++      delete safe.contactInfo;
++      if (safe.reporter && typeof safe.reporter === "object") {
++        delete safe.reporter.email;
++        delete safe.reporter.phone;
++        delete safe.reporter.mobile;
++      }
++    }
++
++    res.json({ success: true, item: safe });
+   } catch (error) {
+     console.error("❌ Failed to fetch item:", error);
+     res.status(500).json({ success: false, message: "Server error" });
+diff --git a/routes/shipments.js b/routes/shipments.js
+index d2eacee..735d610 100644
+--- a/routes/shipments.js
++++ b/routes/shipments.js
+@@ -12,7 +12,12 @@ router.get('/my', protect, async (req, res) => {
+       .populate('item', 'title type category images')
+       .sort({ createdAt: -1 })
+       .lean();
+-    res.json({ success: true, data: items });
++    res.json({
++      success: true,
++      shipments: items,
++      items,
++      data: items
++    });
+   } catch (err) {
+     res.status(500).json({ success: false, message: err.message });
+   }
+@@ -36,7 +41,12 @@ router.get('/:id', protect, async (req, res) => {
+     const isAdmin = req.user?.role === 'admin';
+     if (!isOwner && !isAdmin) return res.status(403).json({ success: false, message: 'Forbidden' });
+ 
+-    res.json({ success: true, data: shipment });
++    res.json({
++      success: true,
++      shipment,
++      item: shipment, // compatibility alias
++      data: shipment
++    });
+   } catch (err) {
+     res.status(500).json({ success: false, message: err.message });
+   }
+@@ -53,7 +63,12 @@ router.post('/', protect, async (req, res) => {
+       trackingNumber: trackingNumber || undefined,
+       address: address || undefined
+     });
+-    res.status(201).json({ success: true, data: shipment });
++    res.status(201).json({
++      success: true,
++      shipment,
++      item: shipment, // compatibility alias
++      data: shipment
++    });
+   } catch (err) {
+     res.status(500).json({ success: false, message: err.message });
+   }
+diff --git a/server.js b/server.js
+index b07203d..5c454e0 100644
+--- a/server.js
++++ b/server.js
+@@ -190,6 +190,37 @@ app.get("/", (req, res) => {
+ // =================================================
+ io.on("connection", (socket) => {
+   logger.info(`🔌 Client connected: ${socket.id}`);
++
++  // Rooms for chat threads (frontend uses `chat:join` / `chat:leave`).
++  socket.on("chat:join", ({ room } = {}) => {
++    if (!room) return;
++    try {
++      socket.join(room);
++    } catch {
++      // ignore
++    }
++  });
++
++  socket.on("chat:leave", ({ room } = {}) => {
++    if (!room) return;
++    try {
++      socket.leave(room);
++    } catch {
++      // ignore
++    }
++  });
++
++  // Allow clients to broadcast chat messages in a room (best-effort realtime).
++  // Canonical persistence is via REST `/api/chat/items/:itemId/messages`.
++  socket.on("chat:message", ({ room, message } = {}) => {
++    if (!room || !message) return;
++    try {
++      io.to(room).emit("chat:message", { room, message });
++    } catch {
++      // ignore
++    }
++  });
++
+   socket.on("disconnect", (reason) => {
+     logger.info(`❌ Client disconnected: ${socket.id} - ${reason}`);
+   });
+diff --git a/utils/clipClient.js b/utils/clipClient.js
+index 978035f..d31ad36 100644
+--- a/utils/clipClient.js
++++ b/utils/clipClient.js
+@@ -127,4 +127,35 @@ async function getTextEmbedding(text) {
+   }
+ }
+ 
+-module.exports = { getClipBase, checkClipHealth, getImageEmbedding, getTextEmbedding };
++async function analyzeImage(imagePath, { doOcr = true, doBarcode = true, ocrLang = "eng", ocrPsm = 6 } = {}) {
++  try {
++    if (!CLIP_BASE) {
++      console.warn("⚠️ CLIP_URL not configured; skipping analyze-image");
++      return null;
++    }
++    const formData = new FormData();
++    formData.append("file", fs.createReadStream(imagePath));
++    formData.append("doOcr", String(doOcr));
++    formData.append("doBarcode", String(doBarcode));
++    formData.append("ocrLang", String(ocrLang));
++    formData.append("ocrPsm", String(ocrPsm));
++
++    const res = await axios.post(`${CLIP_BASE}/analyze-image`, formData, {
++      headers: clipHeaders(formData),
++      timeout: 120000,
++      maxBodyLength: Infinity,
++      maxContentLength: Infinity,
++      validateStatus: () => true,
++    });
++
++    if (res.status < 200 || res.status >= 300) {
++      return { ok: false, status: res.status, data: res.data };
++    }
++    return { ok: true, status: res.status, data: res.data };
++  } catch (err) {
++    console.error("❌ CLIP analyze-image failed:", err.response?.data || err.message);
++    return { ok: false, status: err?.response?.status, error: err.message };
++  }
++}
++
++module.exports = { getClipBase, checkClipHealth, getImageEmbedding, getTextEmbedding, analyzeImage };
+-- 
+2.43.0
+
