@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -765,80 +765,79 @@ async def analyze_image(
 
 @app.post("/items", status_code=201)
 async def create_item(
-    name: str = Form(...),
-    description: Optional[str] = Form(default=None),
-    file: Optional[UploadFile] = File(default=None),
-    image: Optional[UploadFile] = File(default=None),
-    doOcr: bool = Form(default=True),
-    doBarcode: bool = Form(default=True),
-    ocrLang: str = Form(default="eng"),
-    ocrPsm: int = Form(default=6),
+    payload: dict = Body(...),
     authorization: Optional[str] = Header(default=None),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
 ):
-    """Create an item, storing CLIP embedding + optional OCR + barcode results."""
+    """
+    Create an item (store-only).
+
+    This endpoint does NOT compute CLIP/OCR/barcodes. Use compute endpoints first:
+      - /analyze-image (image -> embedding + OCR + barcodes)
+      - /encode-image (image -> embedding)
+    Then POST the resulting data here to persist it.
+    """
     t0 = time.time()
     endpoint = "/items:create"
     require_auth(authorization)
-    model, processor = load_model()
+    request_id = _request_id_from_header(x_request_id)
 
-    clean_name = (name or "").strip()
+    if not isinstance(payload, dict):
+        if METRIC_REQUESTS is not None:
+            METRIC_REQUESTS.labels(endpoint=endpoint, status="422").inc()
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object.")
+
+    # Required: name
+    clean_name = ((payload.get("name") or "") if isinstance(payload.get("name"), str) else "").strip()
     if not clean_name:
         if METRIC_REQUESTS is not None:
             METRIC_REQUESTS.labels(endpoint=endpoint, status="422").inc()
-        raise HTTPException(status_code=422, detail="Field 'name' must be non-empty.")
+        raise HTTPException(status_code=422, detail="Field 'name' must be a non-empty string.")
 
-    upload = file or image
-    if upload is None:
+    # Required: embedding
+    emb = payload.get("clipEmbedding", None)
+    if emb is None:
+        # Back-compat / internal name
+        emb = payload.get("embedding", None)
+    if not isinstance(emb, list) or not emb:
         if METRIC_REQUESTS is not None:
-            METRIC_REQUESTS.labels(endpoint=endpoint, status="400").inc()
-        raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
-    request_id = _request_id_from_header(x_request_id)
+            METRIC_REQUESTS.labels(endpoint=endpoint, status="422").inc()
+        raise HTTPException(status_code=422, detail="Field 'clipEmbedding' (array of numbers) is required.")
+    if len(emb) > 8192:
+        raise HTTPException(status_code=422, detail="Field 'clipEmbedding' is too large.")
+    try:
+        emb = [float(x) for x in emb]
+    except Exception as e:
+        raise HTTPException(status_code=422, detail="Field 'clipEmbedding' must contain only numbers.") from e
 
-    raw = await _read_upload_bytes(upload)
-    pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
-    input_hash = _sha256_hex(raw)
+    # Optional: description
+    description = payload.get("description")
+    if description is not None and not isinstance(description, str):
+        raise HTTPException(status_code=422, detail="Field 'description' must be a string.")
+    description = (description.strip() if isinstance(description, str) and description.strip() else None)
 
-    # CLIP
-    inputs = processor(images=pil_image, return_tensors="pt")
-    with torch.no_grad():
-        emb = model.get_image_features(**inputs)
-    emb = _normalize_embedding(emb).squeeze().tolist()
-
-    # OCR / Barcode
+    # Optional: OCR (either flattened or nested)
     ocr_text = None
     ocr_words = None
-    if doOcr:
-        try:
-            ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
-            if METRIC_OCR_OK is not None:
-                METRIC_OCR_OK.labels(lang=str(ocrLang)).inc()
-            ocr_text = ocr.get("fullText")
-            ocr_words = ocr.get("words")
-        except Exception as e:
-            if METRIC_OCR_FAIL is not None:
-                METRIC_OCR_FAIL.labels(lang=str(ocrLang)).inc()
-            store.add_audit_log(
-                event_type="OCR_EXTRACT_FAILED",
-                request_id=request_id,
-                payload={"error": str(e), "ocrLang": ocrLang, "ocrPsm": int(ocrPsm)},
-            )
+    if "ocr" in payload and isinstance(payload.get("ocr"), dict):
+        ocr_text = payload["ocr"].get("fullText")
+        ocr_words = payload["ocr"].get("words")
+    else:
+        ocr_text = payload.get("ocrText")
+        ocr_words = payload.get("ocrWords")
+    if ocr_text is not None and not isinstance(ocr_text, str):
+        raise HTTPException(status_code=422, detail="Field 'ocr.fullText' (or 'ocrText') must be a string.")
+    if ocr_words is not None and not isinstance(ocr_words, list):
+        raise HTTPException(status_code=422, detail="Field 'ocr.words' (or 'ocrWords') must be an array.")
 
-    barcodes = None
-    if doBarcode:
-        try:
-            barcode = scan_barcodes(pil_image)
-            if METRIC_BARCODE_OK is not None:
-                METRIC_BARCODE_OK.inc()
-            barcodes = barcode.get("barcodes")
-        except Exception as e:
-            if METRIC_BARCODE_FAIL is not None:
-                METRIC_BARCODE_FAIL.inc()
-            store.add_audit_log(event_type="BARCODE_SCAN_FAILED", request_id=request_id, payload={"error": str(e)})
+    # Optional: barcodes
+    barcodes = payload.get("barcodes")
+    if barcodes is not None and not isinstance(barcodes, list):
+        raise HTTPException(status_code=422, detail="Field 'barcodes' must be an array.")
 
     item = store.create_item(
         name=clean_name,
-        description=(description.strip() if description and description.strip() else None),
+        description=description,
         clip_embedding=emb,
         ocr_text=ocr_text,
         ocr_words=ocr_words,
@@ -854,7 +853,7 @@ async def create_item(
             "name": item["name"],
             "description": item["description"],
             "status": item["status"],
-            "input": {"sha256": input_hash, "bytes": len(raw), "contentType": upload.content_type},
+            "input": {"provided": {"hasOcr": ocr_text is not None or ocr_words is not None, "hasBarcodes": barcodes is not None}},
             "governance": _governance_meta(),
         },
     )
@@ -863,7 +862,7 @@ async def create_item(
             event_type="OCR_EXTRACT",
             item_id=item["id"],
             request_id=request_id,
-            payload={"meta": {"lang": ocrLang, "psm": int(ocrPsm)}, "wordCount": len(ocr_words or []), "fullText": ocr_text},
+            payload={"meta": {}, "wordCount": len(ocr_words or []), "fullText": ocr_text},
         )
     if barcodes is not None:
         store.add_audit_log(
