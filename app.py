@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -71,6 +71,8 @@ SERVICE_VERSION = os.environ.get("SERVICE_VERSION", "dev").strip() or "dev"
 MODEL_ID = os.environ.get("MODEL_ID", "openai/clip-vit-base-patch32").strip() or "openai/clip-vit-base-patch32"
 
 store = SqliteStore(DB_PATH)
+
+_ALLOWED_ITEM_STATUSES = {"draft", "released", "archived"}
 
 # ---------------------------------------------------------
 # Metrics (Prometheus)
@@ -761,7 +763,7 @@ async def analyze_image(
     }
 
 
-@app.post("/items")
+@app.post("/items", status_code=201)
 async def create_item(
     name: str = Form(...),
     description: Optional[str] = Form(default=None),
@@ -779,6 +781,12 @@ async def create_item(
     endpoint = "/items:create"
     require_auth(authorization)
     model, processor = load_model()
+
+    clean_name = (name or "").strip()
+    if not clean_name:
+        if METRIC_REQUESTS is not None:
+            METRIC_REQUESTS.labels(endpoint=endpoint, status="422").inc()
+        raise HTTPException(status_code=422, detail="Field 'name' must be non-empty.")
 
     upload = file or image
     if upload is None:
@@ -829,8 +837,8 @@ async def create_item(
             store.add_audit_log(event_type="BARCODE_SCAN_FAILED", request_id=request_id, payload={"error": str(e)})
 
     item = store.create_item(
-        name=name.strip(),
-        description=(description.strip() if description else None),
+        name=clean_name,
+        description=(description.strip() if description and description.strip() else None),
         clip_embedding=emb,
         ocr_text=ocr_text,
         ocr_words=ocr_words,
@@ -868,18 +876,23 @@ async def create_item(
     if METRIC_LATENCY is not None:
         METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - t0))
     if METRIC_REQUESTS is not None:
-        METRIC_REQUESTS.labels(endpoint=endpoint, status="200").inc()
+        METRIC_REQUESTS.labels(endpoint=endpoint, status="201").inc()
 
     return {"requestId": request_id, "governance": _governance_meta(), "item": item}
 
 
 @app.get("/items")
 def list_items(
-    status: Optional[str] = None,
-    limit: int = 500,
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=5000),
     authorization: Optional[str] = Header(default=None),
 ):
     require_auth(authorization)
+    if status is not None:
+        s = status.strip().lower()
+        if s and s not in _ALLOWED_ITEM_STATUSES:
+            raise HTTPException(status_code=400, detail=f"Invalid status. Use one of: {sorted(_ALLOWED_ITEM_STATUSES)}")
+        status = s or None
     return {"items": store.list_items(status=status, limit=limit)}
 
 

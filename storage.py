@@ -288,13 +288,16 @@ class SqliteStore:
                 ).fetchall()
         out: List[Dict[str, Any]] = []
         for r in rows:
+            emb = _json_loads(r["clip_embedding_json"], default=[])
             out.append(
                 {
                     "id": r["id"],
                     "name": r["name"],
                     "description": r["description"],
                     "status": r["status"],
-                    "embedding": _json_loads(r["clip_embedding_json"], default=[]),
+                    # Back-compat: internal code uses `embedding`, while many clients expect `clipEmbedding`.
+                    "embedding": emb,
+                    "clipEmbedding": emb,
                     "ocrText": r["ocr_text"],
                     "barcodes": _json_loads(r["barcodes_json"], default=[]),
                 }
@@ -302,14 +305,21 @@ class SqliteStore:
         return out
 
     def _row_to_item(self, r: sqlite3.Row) -> Dict[str, Any]:
+        emb = _json_loads(r["clip_embedding_json"], default=[])
+        ocr_text = r["ocr_text"]
+        ocr_words = _json_loads(r["ocr_words_json"], default=[])
         return {
             "id": r["id"],
             "name": r["name"],
             "description": r["description"],
             "status": r["status"],
-            "embedding": _json_loads(r["clip_embedding_json"], default=[]),
-            "ocrText": r["ocr_text"],
-            "ocrWords": _json_loads(r["ocr_words_json"], default=[]),
+            # Back-compat: keep `embedding`, but also expose `clipEmbedding` (mirrors `models/item.js`).
+            "embedding": emb,
+            "clipEmbedding": emb,
+            # Back-compat: keep flattened OCR fields, but also expose `ocr` object.
+            "ocrText": ocr_text,
+            "ocrWords": ocr_words,
+            "ocr": {"fullText": ocr_text or "", "words": ocr_words, "meta": {}},
             "barcodes": _json_loads(r["barcodes_json"], default=[]),
             "createdAt": r["created_at"],
             "updatedAt": r["updated_at"],
