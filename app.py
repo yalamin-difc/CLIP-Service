@@ -19,7 +19,7 @@ import time
 from barcode_service import scan_barcodes
 from match_service import build_explanation, cosine_similarity, should_return_no_match, softmax_confidences
 from ocr_service import extract_ocr
-from storage import SqliteStore
+from storage import MongoStore
 
 try:
     from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -59,7 +59,8 @@ app.add_middleware(
 import os
 
 CLIP_API_KEY = os.environ.get("CLIP_API_KEY", "").strip()
-DB_PATH = os.environ.get("DB_PATH", "/tmp/clip_service.sqlite").strip() or "/tmp/clip_service.sqlite"
+MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
+MONGODB_DB = os.environ.get("MONGODB_DB", "clip_service").strip() or "clip_service"
 
 # Confidence calibration / decisioning controls (env-configurable)
 CONF_TEMPERATURE = float(os.environ.get("CONF_TEMPERATURE", "0.07"))
@@ -70,7 +71,7 @@ CONF_MIN_MARGIN = float(os.environ.get("CONF_MIN_MARGIN", "0.03"))
 SERVICE_VERSION = os.environ.get("SERVICE_VERSION", "dev").strip() or "dev"
 MODEL_ID = os.environ.get("MODEL_ID", "openai/clip-vit-base-patch32").strip() or "openai/clip-vit-base-patch32"
 
-store = SqliteStore(DB_PATH)
+store = MongoStore(MONGODB_URI, db_name=MONGODB_DB)
 
 _ALLOWED_ITEM_STATUSES = {"draft", "released", "archived"}
 

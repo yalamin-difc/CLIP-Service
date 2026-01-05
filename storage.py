@@ -1,84 +1,64 @@
-import json
-import os
-import sqlite3
-import uuid
-from contextlib import contextmanager
+from __future__ import annotations
+
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+
+from bson import ObjectId
+from pymongo import MongoClient
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return _utc_now().isoformat()
 
 
-def _json_dumps(v: Any) -> str:
-    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
-
-
-def _json_loads(s: Optional[str], default: Any) -> Any:
-    if not s:
-        return default
+def _coerce_object_id(value: str) -> ObjectId:
     try:
-        return json.loads(s)
-    except Exception:
-        return default
+        return ObjectId(str(value))
+    except Exception as e:
+        raise KeyError(value) from e
 
 
-class SqliteStore:
+def _oid_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, ObjectId):
+        return str(v)
+    return str(v)
+
+
+class MongoStore:
     """
-    Lightweight persistence layer for:
-      - items (image embedding + OCR text + barcode values)
-      - audit logs (ocr/barcode/match/release events)
+    MongoDB (Atlas) persistence layer for:
+      - items
+      - audit logs
+
+    MongoDB is the single source of truth (no SQLite fallback).
     """
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self._init_db()
+    def __init__(
+        self,
+        mongo_uri: str,
+        *,
+        db_name: str = "clip_service",
+        items_collection: str = "items",
+        audit_collection: str = "audit_logs",
+    ):
+        if not (mongo_uri or "").strip():
+            raise RuntimeError("Missing MONGODB_URI")
+        self.client = MongoClient(mongo_uri)
+        self.db = self.client[db_name]
+        self.items = self.db[items_collection]
+        self.audit_logs = self.db[audit_collection]
 
-    @contextmanager
-    def _conn(self) -> Iterable[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
-
-    def _init_db(self) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS items (
-                  id TEXT PRIMARY KEY,
-                  name TEXT NOT NULL,
-                  description TEXT,
-                  status TEXT NOT NULL,
-                  clip_embedding_json TEXT NOT NULL,
-                  ocr_text TEXT,
-                  ocr_words_json TEXT,
-                  barcodes_json TEXT,
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL,
-                  released_at TEXT
-                )
-                """.strip()
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_logs (
-                  id TEXT PRIMARY KEY,
-                  ts TEXT NOT NULL,
-                  event_type TEXT NOT NULL,
-                  item_id TEXT,
-                  request_id TEXT,
-                  payload_json TEXT NOT NULL
-                )
-                """.strip()
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_item ON audit_logs(item_id)")
+        # Ensure helpful indexes (idempotent)
+        self.items.create_index([("status", 1), ("updatedAt", -1)])
+        self.items.create_index([("releasedAt", -1)])
+        self.audit_logs.create_index([("ts", -1)])
+        self.audit_logs.create_index([("itemId", 1), ("ts", -1)])
 
     # ----------------------------
     # Audit logging
@@ -92,23 +72,15 @@ class SqliteStore:
         request_id: Optional[str] = None,
         ts: Optional[str] = None,
     ) -> str:
-        log_id = str(uuid.uuid4())
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO audit_logs(id, ts, event_type, item_id, request_id, payload_json)
-                VALUES(?, ?, ?, ?, ?, ?)
-                """.strip(),
-                (
-                    log_id,
-                    ts or _utc_now_iso(),
-                    event_type,
-                    item_id,
-                    request_id,
-                    _json_dumps(payload),
-                ),
-            )
-        return log_id
+        doc = {
+            "ts": ts or _utc_now_iso(),
+            "eventType": event_type,
+            "itemId": item_id,
+            "requestId": request_id,
+            "payload": payload or {},
+        }
+        res = self.audit_logs.insert_one(doc)
+        return str(res.inserted_id)
 
     def list_audit_logs(
         self,
@@ -119,39 +91,23 @@ class SqliteStore:
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 1000))
         offset = max(0, int(offset))
-        with self._conn() as conn:
-            if item_id:
-                rows = conn.execute(
-                    """
-                    SELECT id, ts, event_type, item_id, request_id, payload_json
-                    FROM audit_logs
-                    WHERE item_id = ?
-                    ORDER BY ts DESC
-                    LIMIT ? OFFSET ?
-                    """.strip(),
-                    (item_id, limit, offset),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT id, ts, event_type, item_id, request_id, payload_json
-                    FROM audit_logs
-                    ORDER BY ts DESC
-                    LIMIT ? OFFSET ?
-                    """.strip(),
-                    (limit, offset),
-                ).fetchall()
-        return [
-            {
-                "id": r["id"],
-                "ts": r["ts"],
-                "eventType": r["event_type"],
-                "itemId": r["item_id"],
-                "requestId": r["request_id"],
-                "payload": _json_loads(r["payload_json"], default={}),
-            }
-            for r in rows
-        ]
+        q: Dict[str, Any] = {}
+        if item_id:
+            q["itemId"] = item_id
+        cur = self.audit_logs.find(q).sort("ts", -1).skip(offset).limit(limit)
+        out: List[Dict[str, Any]] = []
+        for d in cur:
+            out.append(
+                {
+                    "id": _oid_str(d.get("_id")),
+                    "ts": d.get("ts"),
+                    "eventType": d.get("eventType"),
+                    "itemId": d.get("itemId"),
+                    "requestId": d.get("requestId"),
+                    "payload": d.get("payload") or {},
+                }
+            )
+        return out
 
     # ----------------------------
     # Items
@@ -167,33 +123,20 @@ class SqliteStore:
         barcodes: Optional[List[Dict[str, Any]]],
         status: str = "draft",
     ) -> Dict[str, Any]:
-        item_id = str(uuid.uuid4())
         now = _utc_now_iso()
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO items(
-                  id, name, description, status, clip_embedding_json,
-                  ocr_text, ocr_words_json, barcodes_json,
-                  created_at, updated_at, released_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """.strip(),
-                (
-                    item_id,
-                    name,
-                    description,
-                    status,
-                    _json_dumps(clip_embedding),
-                    ocr_text,
-                    _json_dumps(ocr_words) if ocr_words is not None else None,
-                    _json_dumps(barcodes) if barcodes is not None else None,
-                    now,
-                    now,
-                    None,
-                ),
-            )
-        return self.get_item(item_id)
+        doc: Dict[str, Any] = {
+            "name": name,
+            "description": description or "",
+            "status": status,
+            "clipEmbedding": clip_embedding,
+            "ocr": {"fullText": ocr_text or "", "words": (ocr_words or []), "meta": {}},
+            "barcodes": barcodes or [],
+            "releasedAt": None,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        res = self.items.insert_one(doc)
+        return self.get_item(str(res.inserted_id))
 
     def update_item_signals(
         self,
@@ -203,22 +146,18 @@ class SqliteStore:
         ocr_words: Optional[List[Dict[str, Any]]] = None,
         barcodes: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        now = _utc_now_iso()
-        fields: List[Tuple[str, Any]] = []
+        update: Dict[str, Any] = {"updatedAt": _utc_now_iso()}
         if ocr_text is not None:
-            fields.append(("ocr_text", ocr_text))
+            update["ocr.fullText"] = ocr_text
         if ocr_words is not None:
-            fields.append(("ocr_words_json", _json_dumps(ocr_words)))
+            update["ocr.words"] = ocr_words
         if barcodes is not None:
-            fields.append(("barcodes_json", _json_dumps(barcodes)))
-        if not fields:
+            update["barcodes"] = barcodes
+        if len(update) == 1:
             return self.get_item(item_id)
-        set_sql = ", ".join([f"{k}=?" for k, _ in fields] + ["updated_at=?"])
-        params = [v for _, v in fields] + [now, item_id]
-        with self._conn() as conn:
-            cur = conn.execute(f"UPDATE items SET {set_sql} WHERE id=?", params)
-            if cur.rowcount == 0:
-                raise KeyError(item_id)
+        res = self.items.update_one({"_id": _coerce_object_id(item_id)}, {"$set": update})
+        if res.matched_count == 0:
+            raise KeyError(item_id)
         return self.get_item(item_id)
 
     def set_item_status(
@@ -229,100 +168,87 @@ class SqliteStore:
         released: bool = False,
     ) -> Dict[str, Any]:
         now = _utc_now_iso()
-        released_at = now if released else None
-        with self._conn() as conn:
-            cur = conn.execute(
-                """
-                UPDATE items
-                SET status=?, updated_at=?, released_at=COALESCE(?, released_at)
-                WHERE id=?
-                """.strip(),
-                (status, now, released_at, item_id),
-            )
-            if cur.rowcount == 0:
-                raise KeyError(item_id)
+        update: Dict[str, Any] = {"status": status, "updatedAt": now}
+        if released:
+            # Only set releasedAt if not already set.
+            update["releasedAt"] = now
+        res = self.items.update_one({"_id": _coerce_object_id(item_id)}, {"$set": update})
+        if res.matched_count == 0:
+            raise KeyError(item_id)
         return self.get_item(item_id)
 
     def get_item(self, item_id: str) -> Dict[str, Any]:
-        with self._conn() as conn:
-            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
-        if row is None:
+        d = self.items.find_one({"_id": _coerce_object_id(item_id)})
+        if d is None:
             raise KeyError(item_id)
-        return self._row_to_item(row)
+        return self._doc_to_item(d)
 
     def list_items(self, *, status: Optional[str] = None, limit: int = 500) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 5000))
-        with self._conn() as conn:
-            if status:
-                rows = conn.execute(
-                    "SELECT * FROM items WHERE status=? ORDER BY updated_at DESC LIMIT ?",
-                    (status, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM items ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
-        return [self._row_to_item(r) for r in rows]
+        q: Dict[str, Any] = {}
+        if status:
+            q["status"] = status
+        cur = self.items.find(q).sort("updatedAt", -1).limit(limit)
+        return [self._doc_to_item(d) for d in cur]
 
     def list_item_embeddings(self, *, status: Optional[str] = "released", limit: int = 5000) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit), 5000))
-        with self._conn() as conn:
-            if status:
-                rows = conn.execute(
-                    """
-                    SELECT id, name, description, status, clip_embedding_json, ocr_text, barcodes_json, updated_at
-                    FROM items
-                    WHERE status=?
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                    """.strip(),
-                    (status, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT id, name, description, status, clip_embedding_json, ocr_text, barcodes_json, updated_at
-                    FROM items
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                    """.strip(),
-                    (limit,),
-                ).fetchall()
+        q: Dict[str, Any] = {}
+        if status:
+            q["status"] = status
+        cur = (
+            self.items.find(
+                q,
+                {
+                    "name": 1,
+                    "description": 1,
+                    "status": 1,
+                    "clipEmbedding": 1,
+                    "ocr.fullText": 1,
+                    "barcodes": 1,
+                    "updatedAt": 1,
+                },
+            )
+            .sort("updatedAt", -1)
+            .limit(limit)
+        )
         out: List[Dict[str, Any]] = []
-        for r in rows:
-            emb = _json_loads(r["clip_embedding_json"], default=[])
+        for d in cur:
+            emb = d.get("clipEmbedding") or []
+            ocr = d.get("ocr") or {}
             out.append(
                 {
-                    "id": r["id"],
-                    "name": r["name"],
-                    "description": r["description"],
-                    "status": r["status"],
-                    # Back-compat: internal code uses `embedding`, while many clients expect `clipEmbedding`.
+                    "id": _oid_str(d.get("_id")),
+                    "name": d.get("name"),
+                    "description": d.get("description"),
+                    "status": d.get("status"),
+                    # Back-compat: internal matching uses `embedding`.
                     "embedding": emb,
                     "clipEmbedding": emb,
-                    "ocrText": r["ocr_text"],
-                    "barcodes": _json_loads(r["barcodes_json"], default=[]),
+                    "ocrText": ocr.get("fullText"),
+                    "barcodes": d.get("barcodes") or [],
                 }
             )
         return out
 
-    def _row_to_item(self, r: sqlite3.Row) -> Dict[str, Any]:
-        emb = _json_loads(r["clip_embedding_json"], default=[])
-        ocr_text = r["ocr_text"]
-        ocr_words = _json_loads(r["ocr_words_json"], default=[])
+    def _doc_to_item(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        emb = d.get("clipEmbedding") or []
+        ocr = d.get("ocr") or {}
+        ocr_text = ocr.get("fullText")
+        ocr_words = ocr.get("words") or []
         return {
-            "id": r["id"],
-            "name": r["name"],
-            "description": r["description"],
-            "status": r["status"],
-            # Back-compat: keep `embedding`, but also expose `clipEmbedding` (mirrors `models/item.js`).
+            "id": _oid_str(d.get("_id")),
+            "name": d.get("name"),
+            "description": d.get("description"),
+            "status": d.get("status"),
             "embedding": emb,
             "clipEmbedding": emb,
-            # Back-compat: keep flattened OCR fields, but also expose `ocr` object.
+            "ocr": ocr,
             "ocrText": ocr_text,
             "ocrWords": ocr_words,
-            "ocr": {"fullText": ocr_text or "", "words": ocr_words, "meta": {}},
-            "barcodes": _json_loads(r["barcodes_json"], default=[]),
-            "createdAt": r["created_at"],
-            "updatedAt": r["updated_at"],
-            "releasedAt": r["released_at"],
+            "barcodes": d.get("barcodes") or [],
+            "createdAt": d.get("createdAt"),
+            "updatedAt": d.get("updatedAt"),
+            "releasedAt": d.get("releasedAt"),
         }
 
