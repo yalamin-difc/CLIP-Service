@@ -36,7 +36,7 @@ app = FastAPI(title="CLIP Service")
 ALLOWED_ORIGINS = [
     "https://ailostfound.al-amentech.io",
     "https://openailostfound-fccdb129f869.herokuapp.com",
-    "http://localhost:3000",
+    
 ]
 
 # Allows all Vercel previews for this project.
