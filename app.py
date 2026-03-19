@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import threading
@@ -37,6 +38,7 @@ except Exception:  # pragma: no cover
     generate_latest = None
 
 app = FastAPI(title="CLIP Service")
+logger = logging.getLogger(__name__)
 
 ALLOWED_ORIGINS = [
     "https://ailostfound.al-amentech.io",
@@ -1148,8 +1150,8 @@ async def analyze_image(
         manual_ocr_text = compact_text(first_value(form, "ocrText", "ocr"), limit=500) or manual_ocr_text
         manual_barcodes = normalize_barcodes(first_value(form, "barcodeValues", "barcodes"))
         manual_labels = normalize_string_list(first_value(form, "labels", "tags"))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Failed to read optional analyze-image form signals: %s", exc)
 
     ocr_payload = None
     ocr_error = None
