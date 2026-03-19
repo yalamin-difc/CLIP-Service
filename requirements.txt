@@ -2,6 +2,7 @@
 fastapi
 uvicorn
 pillow
+httpx
 pytesseract
 zxing-cpp
 prometheus-client

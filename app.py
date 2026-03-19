@@ -1,27 +1,35 @@
-from typing import Optional
-
-from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi import Header
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from fastapi.responses import Response
-from transformers import CLIPProcessor, CLIPModel
-from PIL import Image
-import torch
-import io
-import uuid
-from datetime import datetime, timezone
+from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
+import re
+import threading
 import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Mapping, Optional
 
-from barcode_service import scan_barcodes
-from match_service import build_explanation, cosine_similarity, should_return_no_match, softmax_confidences
-from ocr_service import extract_ocr
-from storage import MongoStore
+import numpy as np
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from PIL import Image, UnidentifiedImageError
 
-try:
+try:  # pragma: no cover - optional runtime dependency
+    from barcode_service import scan_barcodes as _scan_barcodes
+except Exception:  # pragma: no cover
+    _scan_barcodes = None
+
+try:  # pragma: no cover - optional runtime dependency
+    from ocr_service import extract_ocr as _extract_ocr
+except Exception:  # pragma: no cover
+    _extract_ocr = None
+
+try:  # pragma: no cover - optional runtime dependency
     from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 except Exception:  # pragma: no cover
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
@@ -30,17 +38,25 @@ except Exception:  # pragma: no cover
 
 app = FastAPI(title="CLIP Service")
 
-# ---------------------------------------------------------
-# CORS (MUST be near the top)
-# ---------------------------------------------------------
 ALLOWED_ORIGINS = [
     "https://ailostfound.al-amentech.io",
     "https://openailostfound-fccdb129f869.herokuapp.com",
-    
+    "http://localhost:3000",
 ]
-
-# Allows all Vercel previews for this project.
 ALLOW_ORIGIN_REGEX = r"^https:\/\/ai-lost-and-found-ver-2-.*\.vercel\.app$"
+REQUEST_ID_HEADER = "X-Request-Id"
+MODEL_NAME = os.environ.get("MODEL_ID", "openai/clip-vit-base-patch32").strip() or "openai/clip-vit-base-patch32"
+SERVICE_VERSION = os.environ.get("SERVICE_VERSION", "dev").strip() or "dev"
+DEFAULT_TOP_K = 5
+MAX_TOP_K = 20
+CLIP_API_KEY = os.environ.get("CLIP_API_KEY", "").strip()
+MONGODB_URI = (os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URI") or "").strip()
+MONGODB_DB = os.environ.get("MONGODB_DB", "clip_service").strip() or "clip_service"
+MONGODB_ITEMS_COLLECTION = os.environ.get("MONGODB_COLLECTION", "items").strip() or "items"
+MONGODB_AUDIT_COLLECTION = os.environ.get("MONGODB_AUDIT_COLLECTION", "audit_logs").strip() or "audit_logs"
+CONF_TEMPERATURE = float(os.environ.get("CONF_TEMPERATURE", "0.07"))
+CONF_MIN_SCORE = float(os.environ.get("CONF_MIN_SCORE", "0.22"))
+CONF_MIN_MARGIN = float(os.environ.get("CONF_MIN_MARGIN", "0.03"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,517 +67,983 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------
-# Auth (optional)
-# If CLIP_API_KEY is set, require:
-#   Authorization: Bearer <CLIP_API_KEY>
-# ---------------------------------------------------------
-import os
-
-CLIP_API_KEY = os.environ.get("CLIP_API_KEY", "").strip()
-MONGODB_URI = os.environ.get("MONGODB_URI", "").strip()
-MONGODB_DB = os.environ.get("MONGODB_DB", "clip_service").strip() or "clip_service"
-
-# Confidence calibration / decisioning controls (env-configurable)
-CONF_TEMPERATURE = float(os.environ.get("CONF_TEMPERATURE", "0.07"))
-CONF_MIN_SCORE = float(os.environ.get("CONF_MIN_SCORE", "0.22"))
-CONF_MIN_MARGIN = float(os.environ.get("CONF_MIN_MARGIN", "0.03"))
-
-# Service/model governance metadata (env-configurable)
-SERVICE_VERSION = os.environ.get("SERVICE_VERSION", "dev").strip() or "dev"
-MODEL_ID = os.environ.get("MODEL_ID", "openai/clip-vit-base-patch32").strip() or "openai/clip-vit-base-patch32"
-
-store = MongoStore(MONGODB_URI, db_name=MONGODB_DB)
-
-_ALLOWED_ITEM_STATUSES = {"draft", "released", "archived"}
-
-# ---------------------------------------------------------
-# Metrics (Prometheus)
-# ---------------------------------------------------------
 if Counter is not None:
     METRIC_REQUESTS = Counter("clip_service_requests_total", "Requests", ["endpoint", "status"])
     METRIC_LATENCY = Histogram("clip_service_request_latency_seconds", "Request latency", ["endpoint"])
     METRIC_MODEL_LOADED = Gauge("clip_service_model_loaded", "Model loaded (1/0)")
-    METRIC_OCR_OK = Counter("clip_service_ocr_ok_total", "OCR successes", ["lang"])
-    METRIC_OCR_FAIL = Counter("clip_service_ocr_fail_total", "OCR failures", ["lang"])
-    METRIC_BARCODE_OK = Counter("clip_service_barcode_ok_total", "Barcode scan successes")
-    METRIC_BARCODE_FAIL = Counter("clip_service_barcode_fail_total", "Barcode scan failures")
-    METRIC_MATCH_NO_MATCH = Counter("clip_service_match_no_match_total", "No-match decisions")
-else:
-    METRIC_REQUESTS = METRIC_LATENCY = METRIC_MODEL_LOADED = None
-    METRIC_OCR_OK = METRIC_OCR_FAIL = None
-    METRIC_BARCODE_OK = METRIC_BARCODE_FAIL = None
-    METRIC_MATCH_NO_MATCH = None
+else:  # pragma: no cover
+    METRIC_REQUESTS = None
+    METRIC_LATENCY = None
+    METRIC_MODEL_LOADED = None
 
 
-def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sha256_hex(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def get_request_id(request: Request) -> Optional[str]:
+    return getattr(request.state, "request_id", None)
+
+
+def with_request_id(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
+    body = dict(payload)
+    body.setdefault("requestId", get_request_id(request))
+    return body
+
+
+def problem_detail(code: str, message: str, details: Any = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"code": code, "message": message}
+    if details is not None:
+        payload["details"] = details
+    return payload
+
+
+def default_error_code(status_code: int) -> str:
+    return {
+        400: "invalid_request",
+        401: "unauthorized",
+        403: "forbidden",
+        404: "not_found",
+        409: "conflict",
+        422: "validation_error",
+        500: "internal_error",
+        503: "service_unavailable",
+    }.get(status_code, "http_error")
+
+
+def error_response(
+    request: Request,
+    status_code: int,
+    code: str,
+    message: str,
+    details: Any = None,
+) -> JSONResponse:
+    request_id = get_request_id(request)
+    payload: Dict[str, Any] = {
+        "success": False,
+        "error": {
+            "status": status_code,
+            "code": code,
+            "message": message,
+            "requestId": request_id,
+        },
+    }
+    if details is not None:
+        payload["error"]["details"] = details
+    headers = {REQUEST_ID_HEADER: request_id} if request_id else None
+    return JSONResponse(status_code=status_code, content=payload, headers=headers)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get(REQUEST_ID_HEADER, "").strip() or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers[REQUEST_ID_HEADER] = request_id
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    details = None
+    code = default_error_code(exc.status_code)
+    message = str(exc.detail) if exc.detail is not None else "Request failed."
+    if isinstance(exc.detail, dict):
+        code = str(exc.detail.get("code") or code)
+        message = str(exc.detail.get("message") or message)
+        details = exc.detail.get("details")
+    elif isinstance(exc.detail, list):
+        message = "Request failed."
+        details = exc.detail
+    return error_response(request, exc.status_code, code, message, details)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return error_response(request, 422, "validation_error", "Request validation failed.", exc.errors())
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    return error_response(request, 500, "internal_error", "An unexpected error occurred.")
+
+
+def record_request_metric(endpoint: str, status: int) -> None:
+    if METRIC_REQUESTS is not None:
+        METRIC_REQUESTS.labels(endpoint=endpoint, status=str(status)).inc()
+
+
+def record_latency_metric(endpoint: str, started_at: float) -> None:
+    if METRIC_LATENCY is not None:
+        METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - started_at))
+
+
+def governance_meta(**extra: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "engine": "clip",
+        "serviceVersion": SERVICE_VERSION,
+        "modelId": MODEL_NAME,
+        "confidence": {
+            "temperature": CONF_TEMPERATURE,
+            "minScore": CONF_MIN_SCORE,
+            "minMargin": CONF_MIN_MARGIN,
+        },
+    }
+    payload.update(extra)
+    return payload
+
+
+def require_auth(authorization: Optional[str]) -> None:
     if not CLIP_API_KEY:
-        return  # auth disabled
+        return
     if authorization != f"Bearer {CLIP_API_KEY}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(status_code=401, detail=problem_detail("unauthorized", "Unauthorized"))
 
-# ---------------------------------------------------------
-# LAZY LOADING (Cloud Run Safe)
-# ---------------------------------------------------------
+
+def compact_text(value: Optional[str], limit: int = 160) -> Optional[str]:
+    if value is None:
+        return None
+    collapsed = " ".join(str(value).split())
+    if not collapsed:
+        return None
+    return collapsed[: limit - 3] + "..." if len(collapsed) > limit else collapsed
+
+
+def is_upload(value: Any) -> bool:
+    return hasattr(value, "filename") and hasattr(value, "read")
+
+
+def first_value(container: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = container.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def normalize_bool(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise HTTPException(status_code=400, detail=problem_detail("invalid_boolean", "Boolean field contains an invalid value."))
+
+
+def normalize_string_list(value: Any) -> List[str]:
+    if value is None or value == "":
+        return []
+    raw_items: List[Any]
+    if isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped[0] in "[{":
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                raw_items = parsed
+            else:
+                raw_items = re.split(r"[\n,]+", stripped)
+        else:
+            raw_items = re.split(r"[\n,]+", stripped)
+    else:
+        raw_items = [value]
+
+    normalized: List[str] = []
+    seen = set()
+    for item in raw_items:
+        text = compact_text(str(item), limit=120)
+        key = (text or "").lower()
+        if text and key not in seen:
+            normalized.append(text)
+            seen.add(key)
+    return normalized
+
+
+def normalize_mapping(value: Any, field_name: str) -> Dict[str, Any]:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=problem_detail("invalid_json", f"Field '{field_name}' must contain valid JSON."),
+            ) from exc
+        if isinstance(parsed, Mapping):
+            return dict(parsed)
+    raise HTTPException(status_code=400, detail=problem_detail("invalid_payload", f"Field '{field_name}' must be an object."))
+
+
+def parse_top_k(value: Any) -> int:
+    if value is None or value == "":
+        return DEFAULT_TOP_K
+    try:
+        top_k = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=problem_detail("invalid_top_k", "Field 'topK' must be an integer.")) from exc
+    if top_k < 1 or top_k > MAX_TOP_K:
+        raise HTTPException(
+            status_code=400,
+            detail=problem_detail("invalid_top_k", f"Field 'topK' must be between 1 and {MAX_TOP_K}."),
+        )
+    return top_k
+
+
+def tokenize(value: Optional[str]) -> List[str]:
+    if not value:
+        return []
+    return sorted({token.lower() for token in re.findall(r"[A-Za-z0-9]{3,}", value)})
+
+
+def normalize_barcodes(value: Any) -> List[Dict[str, Any]]:
+    if value is None or value == "":
+        return []
+    raw_items: List[Any]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped[0] in "[{":
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            raw_items = parsed if isinstance(parsed, list) else re.split(r"[\n,]+", stripped)
+        else:
+            raw_items = re.split(r"[\n,]+", stripped)
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    normalized: List[Dict[str, Any]] = []
+    seen = set()
+    for item in raw_items:
+        if isinstance(item, Mapping):
+            text = compact_text(str(first_value(item, "text", "value", "code") or ""), limit=160)
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            barcode = dict(item)
+            barcode["text"] = text
+        else:
+            text = compact_text(str(item), limit=160)
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            barcode = {"text": text}
+        seen.add(key)
+        normalized.append(barcode)
+    return normalized
+
+
+def barcode_values(barcodes: List[Dict[str, Any]]) -> List[str]:
+    return [barcode.get("text") for barcode in barcodes if barcode.get("text")]
+
+
+def merge_barcodes(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for group in groups:
+        for item in group or []:
+            text = compact_text(str(item.get("text") or ""), limit=160)
+            key = (text or "").lower()
+            if text and key not in seen:
+                normalized = dict(item)
+                normalized["text"] = text
+                merged.append(normalized)
+                seen.add(key)
+    return merged
+
+
+def compact_signals(ocr_text: Optional[str], barcode_texts: List[str], labels: List[str]) -> Dict[str, Any]:
+    signals: Dict[str, Any] = {}
+    excerpt = compact_text(ocr_text, limit=160)
+    if excerpt:
+        signals["ocr"] = {"excerpt": excerpt}
+    if barcode_texts:
+        signals["barcode"] = {"count": len(barcode_texts), "values": barcode_texts[:3]}
+    if labels:
+        signals["labels"] = labels[:5]
+    return signals
+
+
+def to_numpy(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value, dtype=float)
+
+
+def normalize_vectors(value: Any) -> np.ndarray:
+    array = to_numpy(value)
+    if array.ndim == 1:
+        array = array.reshape(1, -1)
+    if array.ndim != 2 or array.shape[1] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=problem_detail("invalid_embedding", "Embedding must be a one- or two-dimensional numeric vector."),
+        )
+    norms = np.linalg.norm(array, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return array / norms
+
+
+def normalize_embedding(value: Any) -> Optional[List[float]]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=problem_detail("invalid_embedding", "Embedding must be valid JSON.")) from exc
+    return [float(component) for component in normalize_vectors(value)[0].tolist()]
+
+
+@contextmanager
+def inference_mode():
+    try:  # pragma: no cover - import path tested via monkeypatching
+        import torch
+    except ImportError:  # pragma: no cover
+        yield
+        return
+    with torch.no_grad():
+        yield
+
+
 model = None
 processor = None
+model_lock = threading.Lock()
+
 
 def load_model():
     global model, processor
-    if model is None:
-        print("⏳ Loading CLIP model on demand...")
-        model = CLIPModel.from_pretrained(MODEL_ID)
-        processor = CLIPProcessor.from_pretrained(MODEL_ID)
-        print("✅ CLIP model ready!")
+    if model is None or processor is None:
+        with model_lock:
+            if model is None or processor is None:
+                try:
+                    from transformers import CLIPModel, CLIPProcessor
+                except ImportError as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=problem_detail("model_unavailable", "CLIP model dependencies are not installed."),
+                    ) from exc
+                model = CLIPModel.from_pretrained(MODEL_NAME)
+                processor = CLIPProcessor.from_pretrained(MODEL_NAME)
     return model, processor
+
+
+def model_health() -> Dict[str, Any]:
+    return {"name": MODEL_NAME, "loaded": model is not None and processor is not None}
+
+
+async def read_image_upload(upload: Optional[UploadFile], field_name: str) -> tuple[bytes, Image.Image]:
+    if upload is None:
+        raise HTTPException(
+            status_code=400,
+            detail=problem_detail("missing_image", f"Missing image upload in field '{field_name}'."),
+        )
+    try:
+        payload = await upload.read()
+    finally:
+        await upload.close()
+    if not payload:
+        raise HTTPException(status_code=400, detail=problem_detail("invalid_image", "Uploaded image is empty."))
+    try:
+        image = Image.open(io.BytesIO(payload)).convert("RGB")
+    except (UnidentifiedImageError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=problem_detail("invalid_image", "Uploaded file is not a valid image.")) from exc
+    return payload, image
+
+
+def image_info(image: Image.Image, upload: Optional[UploadFile] = None) -> Dict[str, Any]:
+    return {
+        "filename": getattr(upload, "filename", None),
+        "width": image.width,
+        "height": image.height,
+        "mode": image.mode,
+    }
+
+
+def image_embedding_for(image: Image.Image) -> List[float]:
+    model_instance, processor_instance = load_model()
+    try:
+        inputs = processor_instance(images=image, return_tensors="pt")
+        with inference_mode():
+            features = model_instance.get_image_features(**inputs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=problem_detail("model_inference_failed", "Failed to encode image.")) from exc
+    return [float(value) for value in normalize_vectors(features)[0].tolist()]
+
+
+def text_embedding_for(text: str) -> List[float]:
+    model_instance, processor_instance = load_model()
+    try:
+        inputs = processor_instance(text=[text], return_tensors="pt", padding=True)
+        with inference_mode():
+            features = model_instance.get_text_features(**inputs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=problem_detail("model_inference_failed", "Failed to encode text.")) from exc
+    return [float(value) for value in normalize_vectors(features)[0].tolist()]
+
+
+def run_ocr(image: Image.Image, lang: str, psm: int) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if _extract_ocr is None:
+        return None, "OCR service is not available."
+    try:
+        return _extract_ocr(image, lang=lang, psm=int(psm)), None
+    except Exception as exc:  # pragma: no cover - depends on optional runtime tools
+        return None, str(exc)
+
+
+def run_barcode_scan(image: Image.Image) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if _scan_barcodes is None:
+        return None, "Barcode service is not available."
+    try:
+        return _scan_barcodes(image), None
+    except Exception as exc:  # pragma: no cover - depends on optional runtime tools
+        return None, str(exc)
+
+
+def softmax_confidences(scores: List[float], temperature: float = 0.07) -> List[float]:
+    if not scores:
+        return []
+    t = temperature if temperature > 0 else 0.07
+    scaled = np.asarray(scores, dtype=float) / t
+    shifted = scaled - np.max(scaled)
+    exps = np.exp(shifted)
+    total = float(np.sum(exps)) or 1.0
+    return [float(value / total) for value in exps]
+
+
+def should_return_no_match(top_score: float, second_score: Optional[float], min_score: float, min_margin: float) -> tuple[bool, Dict[str, Any]]:
+    if float(top_score) < float(min_score):
+        return True, {"reason": "LOW_TOP_SCORE", "topScore": float(top_score), "minScore": float(min_score)}
+    if second_score is not None and (float(top_score) - float(second_score)) < float(min_margin):
+        return True, {
+            "reason": "LOW_MARGIN",
+            "topScore": float(top_score),
+            "secondScore": float(second_score),
+            "minMargin": float(min_margin),
+        }
+    return False, {
+        "reason": "OK",
+        "topScore": float(top_score),
+        "secondScore": None if second_score is None else float(second_score),
+        "minScore": float(min_score),
+        "minMargin": float(min_margin),
+    }
+
+
+def match_explanation(item: Mapping[str, Any], query_ocr_text: Optional[str], query_barcodes: List[Dict[str, Any]], query_labels: List[str], score: float) -> Dict[str, Any]:
+    query_barcode_map = {value.lower(): value for value in barcode_values(query_barcodes)}
+    item_barcode_map = {value.lower(): value for value in barcode_values(normalize_barcodes(item.get("barcodes") or item.get("barcodeValues")))}
+    barcode_overlap = [item_barcode_map[key] for key in sorted(query_barcode_map.keys() & item_barcode_map.keys())][:3]
+
+    query_ocr_tokens = set(tokenize(query_ocr_text))
+    item_ocr_tokens = set(tokenize(item.get("ocrText")))
+    ocr_overlap = sorted(query_ocr_tokens & item_ocr_tokens)[:5]
+
+    query_label_map = {value.lower(): value for value in query_labels}
+    item_label_map = {value.lower(): value for value in normalize_string_list(item.get("labels"))}
+    label_overlap = [item_label_map[key] for key in sorted(query_label_map.keys() & item_label_map.keys())][:5]
+
+    signals: Dict[str, Any] = {"clipCosine": round(float(score), 6)}
+    reasons: List[str] = []
+    if barcode_overlap:
+        signals["barcode"] = barcode_overlap
+        reasons.append("barcode overlap")
+    if ocr_overlap:
+        signals["ocr"] = ocr_overlap
+        reasons.append("OCR overlap")
+    if label_overlap:
+        signals["labels"] = label_overlap
+        reasons.append("shared labels")
+    if not reasons:
+        reasons.append("visual similarity")
+    return {
+        "reason": ", ".join(reasons),
+        "signals": signals,
+        "scoreBand": "high" if score >= 0.85 else "medium" if score >= 0.65 else "low",
+    }
+
+
+class ItemRepository:
+    def health(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def list_items(self, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def list_released_items(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def add_audit_log(self, event_type: str, payload: Dict[str, Any], item_id: Optional[str] = None, request_id: Optional[str] = None) -> str:
+        raise NotImplementedError
+
+    def list_audit_logs(self, item_id: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class InMemoryItemRepository(ItemRepository):
+    def __init__(self):
+        self._items: Dict[str, Dict[str, Any]] = {}
+        self._logs: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    def health(self) -> Dict[str, Any]:
+        return {"backend": "memory", "configured": False, "ok": True, "items": len(self._items)}
+
+    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            item = self._items.get(item_id)
+            return dict(item) if item else None
+
+    def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            stored = dict(item)
+            self._items[item["id"]] = stored
+            return dict(stored)
+
+    def list_items(self, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = [dict(value) for value in self._items.values()]
+        if status:
+            items = [item for item in items if item.get("status") == status]
+        items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
+        return items[:limit]
+
+    def list_released_items(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = [
+                dict(value)
+                for value in self._items.values()
+                if value.get("released") and value.get("eligibleForMatching")
+            ]
+        items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
+        return items[:limit]
+
+    def add_audit_log(self, event_type: str, payload: Dict[str, Any], item_id: Optional[str] = None, request_id: Optional[str] = None) -> str:
+        with self._lock:
+            log_id = str(uuid.uuid4())
+            self._logs.append(
+                {
+                    "id": log_id,
+                    "ts": now_iso(),
+                    "eventType": event_type,
+                    "itemId": item_id,
+                    "requestId": request_id,
+                    "payload": payload or {},
+                }
+            )
+            return log_id
+
+    def list_audit_logs(self, item_id: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+        with self._lock:
+            logs = list(reversed(self._logs))
+        if item_id:
+            logs = [log for log in logs if log.get("itemId") == item_id]
+        return logs[offset : offset + limit]
+
+
+class UnavailableItemRepository(ItemRepository):
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def health(self) -> Dict[str, Any]:
+        return {"backend": "mongo", "configured": True, "ok": False, "error": self.reason}
+
+    def _raise(self) -> None:
+        raise HTTPException(status_code=503, detail=problem_detail("store_unavailable", self.reason))
+
+    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+        self._raise()
+
+    def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        self._raise()
+
+    def list_items(self, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+        self._raise()
+
+    def list_released_items(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        self._raise()
+
+    def add_audit_log(self, event_type: str, payload: Dict[str, Any], item_id: Optional[str] = None, request_id: Optional[str] = None) -> str:
+        self._raise()
+
+    def list_audit_logs(self, item_id: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+        self._raise()
+
+
+class MongoItemRepository(ItemRepository):
+    def __init__(self, uri: str, database: str, items_collection: str, audit_collection: str):
+        from pymongo import MongoClient
+
+        self._client = MongoClient(uri, serverSelectionTimeoutMS=1000)
+        self._items = self._client[database][items_collection]
+        self._audit = self._client[database][audit_collection]
+        self._items.create_index("id", unique=True)
+        self._items.create_index([("status", 1), ("updatedAt", -1)])
+        self._audit.create_index([("ts", -1)])
+        self._audit.create_index([("itemId", 1), ("ts", -1)])
+
+    def health(self) -> Dict[str, Any]:
+        try:
+            self._client.admin.command("ping")
+            return {"backend": "mongo", "configured": True, "ok": True}
+        except Exception as exc:  # pragma: no cover - depends on live mongo
+            return {"backend": "mongo", "configured": True, "ok": False, "error": str(exc)}
+
+    def _clean_item(self, item: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+        if item is None:
+            return None
+        cleaned = dict(item)
+        cleaned.pop("_id", None)
+        return cleaned
+
+    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+        return self._clean_item(self._items.find_one({"id": item_id}))
+
+    def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        self._items.update_one({"id": item["id"]}, {"$set": item}, upsert=True)
+        stored = self.get_item(item["id"])
+        if stored is None:
+            raise HTTPException(status_code=503, detail=problem_detail("store_unavailable", "Failed to read item after upsert."))
+        return stored
+
+    def list_items(self, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {}
+        if status:
+            query["status"] = status
+        cursor = self._items.find(query).sort("updatedAt", -1).limit(limit)
+        return [self._clean_item(item) for item in cursor if item is not None]
+
+    def list_released_items(self, limit: int = 5000) -> List[Dict[str, Any]]:
+        cursor = self._items.find({"released": True, "eligibleForMatching": True}).sort("updatedAt", -1).limit(limit)
+        return [self._clean_item(item) for item in cursor if item is not None]
+
+    def add_audit_log(self, event_type: str, payload: Dict[str, Any], item_id: Optional[str] = None, request_id: Optional[str] = None) -> str:
+        document = {
+            "ts": now_iso(),
+            "eventType": event_type,
+            "itemId": item_id,
+            "requestId": request_id,
+            "payload": payload or {},
+        }
+        return str(self._audit.insert_one(document).inserted_id)
+
+    def list_audit_logs(self, item_id: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {}
+        if item_id:
+            query["itemId"] = item_id
+        cursor = self._audit.find(query).sort("ts", -1).skip(offset).limit(limit)
+        logs: List[Dict[str, Any]] = []
+        for log in cursor:
+            cleaned = dict(log)
+            cleaned["id"] = str(cleaned.pop("_id"))
+            logs.append(cleaned)
+        return logs
+
+
+repository_lock = threading.Lock()
+repository: Optional[ItemRepository] = None
+
+
+def build_repository() -> ItemRepository:
+    if not MONGODB_URI:
+        return InMemoryItemRepository()
+    try:
+        return MongoItemRepository(MONGODB_URI, MONGODB_DB, MONGODB_ITEMS_COLLECTION, MONGODB_AUDIT_COLLECTION)
+    except Exception as exc:  # pragma: no cover - depends on live mongo
+        return UnavailableItemRepository(f"Mongo repository unavailable: {exc}")
+
+
+def get_repository() -> ItemRepository:
+    global repository
+    if repository is None:
+        with repository_lock:
+            if repository is None:
+                repository = build_repository()
+    return repository
+
+
+def set_item_repository(item_repository: ItemRepository) -> None:
+    global repository
+    repository = item_repository
+
+
+def serialize_item(item: Mapping[str, Any], include_embedding: bool = False) -> Dict[str, Any]:
+    payload = {
+        "id": item.get("id"),
+        "title": item.get("title"),
+        "name": item.get("name"),
+        "description": item.get("description"),
+        "status": item.get("status"),
+        "released": bool(item.get("released")),
+        "eligibleForMatching": bool(item.get("eligibleForMatching")),
+        "ocrText": item.get("ocrText"),
+        "ocr": item.get("ocr"),
+        "ocrWords": item.get("ocrWords"),
+        "barcodes": item.get("barcodes") or [],
+        "barcodeValues": item.get("barcodeValues") or [],
+        "labels": item.get("labels") or [],
+        "metadata": item.get("metadata") or {},
+        "image": item.get("image"),
+        "createdAt": item.get("createdAt"),
+        "updatedAt": item.get("updatedAt"),
+        "releasedAt": item.get("releasedAt"),
+    }
+    if include_embedding and item.get("embedding") is not None:
+        payload["clipEmbedding"] = item.get("embedding")
+    return payload
+
+
+def parse_item_payload(raw_payload: Mapping[str, Any]) -> Dict[str, Any]:
+    payload = dict(raw_payload)
+    nested = payload.get("item")
+    if isinstance(nested, Mapping):
+        payload = {**nested, **{key: value for key, value in payload.items() if key != "item"}}
+
+    item_id = compact_text(str(first_value(payload, "id", "itemId") or str(uuid.uuid4())), limit=120)
+    if not item_id:
+        raise HTTPException(status_code=400, detail=problem_detail("missing_item_id", "Item id is required."))
+
+    item: Dict[str, Any] = {"id": item_id}
+    name = compact_text(first_value(payload, "title", "name"), limit=240)
+    if name is not None:
+        item["title"] = name
+        item["name"] = name
+    if "description" in payload:
+        item["description"] = compact_text(payload.get("description"), limit=500)
+    if "metadata" in payload:
+        item["metadata"] = normalize_mapping(payload.get("metadata"), "metadata")
+    if "labels" in payload or "tags" in payload:
+        item["labels"] = normalize_string_list(first_value(payload, "labels", "tags"))
+    if "status" in payload:
+        item["status"] = compact_text(str(payload.get("status")), limit=32)
+    if "released" in payload:
+        item["released"] = normalize_bool(payload.get("released"), default=False)
+    if "embedding" in payload or "clipEmbedding" in payload:
+        embedding = normalize_embedding(first_value(payload, "embedding", "clipEmbedding"))
+        item["embedding"] = embedding
+        item["clipEmbedding"] = embedding
+
+    ocr_payload = payload.get("ocr")
+    ocr_text = None
+    ocr_words = None
+    ocr_meta = {}
+    if isinstance(ocr_payload, Mapping):
+        ocr_text = compact_text(ocr_payload.get("fullText"), limit=500)
+        words_value = ocr_payload.get("words")
+        ocr_words = list(words_value) if isinstance(words_value, list) else None
+        meta_value = ocr_payload.get("meta")
+        ocr_meta = dict(meta_value) if isinstance(meta_value, Mapping) else {}
+    else:
+        if "ocrText" in payload or "ocr" in payload:
+            ocr_text = compact_text(first_value(payload, "ocrText", "ocr"), limit=500)
+        if "ocrWords" in payload and isinstance(payload.get("ocrWords"), list):
+            ocr_words = list(payload.get("ocrWords"))
+    if ocr_text is not None or ocr_words is not None:
+        item["ocrText"] = ocr_text
+        item["ocrWords"] = ocr_words or []
+        item["ocr"] = {"fullText": ocr_text or "", "words": ocr_words or [], "meta": ocr_meta}
+
+    if "barcodes" in payload or "barcodeValues" in payload:
+        barcodes = normalize_barcodes(first_value(payload, "barcodes", "barcodeValues"))
+        item["barcodes"] = barcodes
+        item["barcodeValues"] = barcode_values(barcodes)
+
+    extras = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {
+            "item",
+            "id",
+            "itemId",
+            "title",
+            "name",
+            "description",
+            "metadata",
+            "labels",
+            "tags",
+            "status",
+            "released",
+            "embedding",
+            "clipEmbedding",
+            "ocr",
+            "ocrText",
+            "ocrWords",
+            "barcodes",
+            "barcodeValues",
+        }
+    }
+    if extras:
+        item["metadata"] = {**item.get("metadata", {}), "extra": extras}
+    return item
+
+
+async def parse_items_request(request: Request) -> Dict[str, Any]:
+    content_type = request.headers.get("content-type", "")
+    upload: Optional[UploadFile] = None
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=problem_detail("invalid_json", "Request body must contain valid JSON.")) from exc
+        if not isinstance(body, Mapping):
+            raise HTTPException(status_code=400, detail=problem_detail("invalid_payload", "Request body must be an object."))
+        return dict(body)
+
+    form = await request.form()
+    parsed = {key: value for key, value in form.items() if not is_upload(value)}
+    item_blob = form.get("item")
+    if isinstance(item_blob, str) and item_blob.strip():
+        try:
+            nested = json.loads(item_blob)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=problem_detail("invalid_json", "Field 'item' must contain valid JSON.")) from exc
+        if not isinstance(nested, Mapping):
+            raise HTTPException(status_code=400, detail=problem_detail("invalid_payload", "Field 'item' must contain an object."))
+        parsed = {**nested, **parsed}
+    upload_value = first_value(form, "file", "image")
+    upload = upload_value if is_upload(upload_value) else None
+    if upload is not None:
+        parsed["upload"] = upload
+    return parsed
+
+
+def prepare_item_for_storage(existing: Optional[Dict[str, Any]], patch: Dict[str, Any]) -> Dict[str, Any]:
+    current = dict(existing or {})
+    current.update(patch)
+    current["id"] = patch["id"]
+    title = current.get("title") or current.get("name")
+    current["title"] = title
+    current["name"] = title
+    current.setdefault("description", None)
+    current.setdefault("metadata", {})
+    current.setdefault("labels", [])
+    current.setdefault("barcodes", [])
+    current.setdefault("barcodeValues", barcode_values(normalize_barcodes(current.get("barcodes") or current.get("barcodeValues"))))
+    current.setdefault("ocrWords", [])
+    if current.get("ocrText") is not None:
+        current["ocr"] = {
+            "fullText": current.get("ocrText") or "",
+            "words": current.get("ocrWords") or [],
+            "meta": (current.get("ocr") or {}).get("meta", {}) if isinstance(current.get("ocr"), Mapping) else {},
+        }
+    else:
+        current.setdefault("ocr", None)
+    if current.get("embedding") is not None:
+        current["clipEmbedding"] = current["embedding"]
+    current.setdefault("released", False)
+    has_embedding = bool(current.get("embedding"))
+    current["eligibleForMatching"] = bool(current.get("released")) and has_embedding
+    explicit_status = compact_text(str(current.get("status")), limit=32) if current.get("status") not in (None, "") else None
+    if explicit_status and explicit_status not in {"stored", "released", "archived", "draft"}:
+        explicit_status = "stored"
+    current["status"] = "released" if current["eligibleForMatching"] else (explicit_status or "stored")
+    current["createdAt"] = current.get("createdAt") or now_iso()
+    current["updatedAt"] = now_iso()
+    if current.get("released") and has_embedding:
+        current["releasedAt"] = current.get("releasedAt") or now_iso()
+    return current
+
+
+UI_HTML = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CLIP Service</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 900px; line-height: 1.5; padding: 0 1rem; }
+      code { background: #f4f4f4; padding: 0.15rem 0.35rem; border-radius: 4px; }
+      pre { background: #111827; color: #f9fafb; padding: 1rem; border-radius: 8px; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>CLIP Service</h1>
+    <p>This service exposes CLIP encoding plus backend-compatible analyze, item, and match endpoints.</p>
+    <ul>
+      <li><code>GET /health</code> - dependency health</li>
+      <li><code>POST /encode-image</code> - image embedding</li>
+      <li><code>POST /encode-text</code> - text embedding</li>
+      <li><code>POST /analyze-image</code> - compact image analysis</li>
+      <li><code>POST /items</code> - upsert stored item</li>
+      <li><code>POST /items/{id}/release</code> - release item for matching</li>
+      <li><code>POST /match</code> - match against released items</li>
+    </ul>
+  </body>
+</html>
+"""
 
 
 @app.get("/metrics")
 def metrics():
     if generate_latest is None:
-        raise HTTPException(status_code=503, detail="Metrics not available (prometheus-client not installed)")
+        raise HTTPException(status_code=503, detail=problem_detail("metrics_unavailable", "Metrics not available."))
     if METRIC_MODEL_LOADED is not None:
-        METRIC_MODEL_LOADED.set(1 if model is not None else 0)
+        METRIC_MODEL_LOADED.set(1 if model is not None and processor is not None else 0)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
-
-async def _upload_to_pil(upload: UploadFile) -> Image.Image:
-    try:
-        raw = await upload.read()
-        return Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Invalid image upload") from e
-
-
-async def _read_upload_bytes(upload: UploadFile) -> bytes:
-    try:
-        return await upload.read()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Failed to read upload") from e
-
-
-def _sha256_hex(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-
-def _governance_meta() -> dict:
-    return {
-        "serviceVersion": SERVICE_VERSION,
-        "modelId": MODEL_ID,
-        "confidence": {"temperature": CONF_TEMPERATURE, "minScore": CONF_MIN_SCORE, "minMargin": CONF_MIN_MARGIN},
-    }
-
-
-def _normalize_embedding(emb: torch.Tensor) -> torch.Tensor:
-    emb = emb / emb.norm(p=2, dim=-1, keepdim=True)
-    return emb
-
-
-def _request_id_from_header(h: Optional[str]) -> str:
-    return (h or "").strip() or str(uuid.uuid4())
-
-# ---------------------------------------------------------
-# Health check
-# ---------------------------------------------------------
 @app.get("/")
-def home():
-    return {"status": "running", "model_loaded": model is not None}
+def home(request: Request):
+    return with_request_id(request, {"status": "running", "modelLoaded": model is not None and processor is not None})
 
 
 @app.get("/health")
-def health():
-    """
-    Lightweight health probe.
-
-    Notes:
-    - Does NOT force model load (keeps probe fast).
-    - Mirrors the root `/` health semantics for compatibility with common
-      load balancer / uptime check expectations.
-    """
-    return {"status": "running", "model_loaded": model is not None}
-
-UI_HTML = r"""<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CLIP Service UI</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-  </head>
-  <body class="bg-slate-950 text-slate-100 min-h-screen">
-    <div class="max-w-5xl mx-auto p-6">
-      <div class="flex items-center justify-between gap-4 mb-8">
-        <div>
-          <h1 class="text-3xl font-semibold tracking-tight">CLIP Service</h1>
-          <p class="text-slate-300 mt-1">Interactive UI for text/image embeddings + similarity.</p>
-        </div>
-        <div class="text-right">
-          <div class="text-xs text-slate-400">Backend</div>
-          <div id="baseUrl" class="font-mono text-sm text-slate-200"></div>
-        </div>
-      </div>
-
-      <section class="mb-6 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-        <div class="flex items-end justify-between gap-4">
-          <div>
-            <h2 class="text-lg font-semibold">Authorization (optional)</h2>
-            <p class="text-sm text-slate-400 mt-1">If the server has <span class="font-mono">CLIP_API_KEY</span> set, paste it here to use the UI.</p>
-          </div>
-          <div class="text-xs text-slate-500">Header: <span class="font-mono">Authorization: Bearer ...</span></div>
-        </div>
-        <div class="mt-4 flex flex-col md:flex-row gap-3 items-stretch">
-          <input id="tokenInput" type="password" class="flex-1 rounded-xl bg-slate-950/60 border border-slate-800 p-3 outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Bearer token (optional)" />
-          <button id="btnSaveToken" class="rounded-xl bg-slate-800 hover:bg-slate-700 px-4 py-2 text-sm font-semibold">Save</button>
-          <button id="btnClearToken" class="rounded-xl bg-slate-800 hover:bg-slate-700 px-4 py-2 text-sm font-semibold">Clear</button>
-        </div>
-        <div id="tokenStatus" class="mt-2 text-xs text-slate-400"></div>
-      </section>
-
-      <div class="grid md:grid-cols-2 gap-6">
-        <!-- Encode Text -->
-        <section class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-          <h2 class="text-lg font-semibold">Encode Text</h2>
-          <p class="text-sm text-slate-400 mt-1">Returns a normalized embedding vector.</p>
-          <div class="mt-4">
-            <label class="text-sm text-slate-300">Text</label>
-            <textarea id="textInput" rows="4" class="mt-2 w-full rounded-xl bg-slate-950/60 border border-slate-800 p-3 outline-none focus:ring-2 focus:ring-indigo-500" placeholder="e.g. a photo of a cat wearing sunglasses"></textarea>
-          </div>
-          <div class="mt-4 flex items-center gap-3">
-            <button id="btnText" class="rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-sm font-semibold">Encode</button>
-            <span id="textStatus" class="text-sm text-slate-400"></span>
-          </div>
-          <div class="mt-4">
-            <div class="text-xs text-slate-400 mb-2">Result</div>
-            <pre id="textOut" class="text-xs whitespace-pre-wrap break-words rounded-xl bg-slate-950/60 border border-slate-800 p-3 min-h-[80px]"></pre>
-          </div>
-        </section>
-
-        <!-- Encode Image -->
-        <section class="rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-          <h2 class="text-lg font-semibold">Encode Image</h2>
-          <p class="text-sm text-slate-400 mt-1">Upload an image, get a normalized embedding vector.</p>
-          <div class="mt-4 flex items-start gap-4">
-            <div class="flex-1">
-              <input id="imgFile" type="file" accept="image/*" class="block w-full text-sm text-slate-300 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-800 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-slate-100 hover:file:bg-slate-700" />
-              <div class="mt-4 flex items-center gap-3">
-                <button id="btnImg" class="rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-sm font-semibold">Encode</button>
-                <span id="imgStatus" class="text-sm text-slate-400"></span>
-              </div>
-            </div>
-            <div class="w-28 h-28 rounded-xl border border-slate-800 bg-slate-950/40 overflow-hidden flex items-center justify-center">
-              <img id="imgPreview" alt="" class="hidden w-full h-full object-cover" />
-              <div id="imgEmpty" class="text-xs text-slate-500">preview</div>
-            </div>
-          </div>
-          <div class="mt-4">
-            <div class="text-xs text-slate-400 mb-2">Result</div>
-            <pre id="imgOut" class="text-xs whitespace-pre-wrap break-words rounded-xl bg-slate-950/60 border border-slate-800 p-3 min-h-[80px]"></pre>
-          </div>
-        </section>
-      </div>
-
-      <!-- Similarity -->
-      <section class="mt-6 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-        <div class="flex items-end justify-between gap-4">
-          <div>
-            <h2 class="text-lg font-semibold">Image Similarity</h2>
-            <p class="text-sm text-slate-400 mt-1">Uploads two images and returns cosine similarity.</p>
-          </div>
-          <div class="text-xs text-slate-400">Endpoint: <span class="font-mono">/similarity</span></div>
-        </div>
-
-        <div class="mt-4 grid md:grid-cols-3 gap-4 items-start">
-          <div>
-            <label class="text-sm text-slate-300">Image 1</label>
-            <input id="simFile1" type="file" accept="image/*" class="mt-2 block w-full text-sm text-slate-300 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-800 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-slate-100 hover:file:bg-slate-700" />
-            <div class="mt-3 w-full h-36 rounded-xl border border-slate-800 bg-slate-950/40 overflow-hidden flex items-center justify-center">
-              <img id="simPrev1" alt="" class="hidden w-full h-full object-cover" />
-              <div id="simEmpty1" class="text-xs text-slate-500">preview</div>
-            </div>
-          </div>
-
-          <div>
-            <label class="text-sm text-slate-300">Image 2</label>
-            <input id="simFile2" type="file" accept="image/*" class="mt-2 block w-full text-sm text-slate-300 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-800 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-slate-100 hover:file:bg-slate-700" />
-            <div class="mt-3 w-full h-36 rounded-xl border border-slate-800 bg-slate-950/40 overflow-hidden flex items-center justify-center">
-              <img id="simPrev2" alt="" class="hidden w-full h-full object-cover" />
-              <div id="simEmpty2" class="text-xs text-slate-500">preview</div>
-            </div>
-          </div>
-
-          <div class="md:pt-6">
-            <button id="btnSim" class="w-full rounded-xl bg-emerald-600 hover:bg-emerald-500 px-4 py-2 text-sm font-semibold">Compute similarity</button>
-            <div id="simStatus" class="mt-3 text-sm text-slate-400"></div>
-            <div class="mt-4 rounded-xl bg-slate-950/60 border border-slate-800 p-4">
-              <div class="text-xs text-slate-400">Similarity</div>
-              <div id="simScore" class="mt-1 text-2xl font-semibold">—</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- Analyze Image (CLIP + OCR + Barcode) -->
-      <section class="mt-6 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-        <div class="flex items-end justify-between gap-4">
-          <div>
-            <h2 class="text-lg font-semibold">Analyze Image (CLIP + OCR + Barcode)</h2>
-            <p class="text-sm text-slate-400 mt-1">One-shot endpoint that returns embedding + OCR text + barcode scan.</p>
-          </div>
-          <div class="text-xs text-slate-400">Endpoint: <span class="font-mono">/analyze-image</span></div>
-        </div>
-
-        <div class="mt-4 grid md:grid-cols-3 gap-4 items-start">
-          <div class="md:col-span-1">
-            <label class="text-sm text-slate-300">Image</label>
-            <input id="anFile" type="file" accept="image/*" class="mt-2 block w-full text-sm text-slate-300 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-800 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-slate-100 hover:file:bg-slate-700" />
-            <div class="mt-3 w-full h-36 rounded-xl border border-slate-800 bg-slate-950/40 overflow-hidden flex items-center justify-center">
-              <img id="anPrev" alt="" class="hidden w-full h-full object-cover" />
-              <div id="anEmpty" class="text-xs text-slate-500">preview</div>
-            </div>
-          </div>
-
-          <div class="md:col-span-1">
-            <div class="flex items-center justify-between gap-3">
-              <label class="text-sm text-slate-300">Options</label>
-              <div class="text-xs text-slate-500">OCR requires Tesseract on server</div>
-            </div>
-            <div class="mt-3 space-y-3">
-              <label class="flex items-center gap-2 text-sm text-slate-300">
-                <input id="anDoOcr" type="checkbox" checked class="accent-indigo-500" />
-                <span>OCR</span>
-              </label>
-              <label class="flex items-center gap-2 text-sm text-slate-300">
-                <input id="anDoBarcode" type="checkbox" checked class="accent-indigo-500" />
-                <span>Barcode</span>
-              </label>
-
-              <div class="grid grid-cols-2 gap-3">
-                <div>
-                  <label class="text-xs text-slate-400">ocrLang</label>
-                  <input id="anOcrLang" value="eng" class="mt-1 w-full rounded-xl bg-slate-950/60 border border-slate-800 p-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
-                </div>
-                <div>
-                  <label class="text-xs text-slate-400">ocrPsm</label>
-                  <input id="anOcrPsm" value="6" inputmode="numeric" class="mt-1 w-full rounded-xl bg-slate-950/60 border border-slate-800 p-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="md:col-span-1 md:pt-6">
-            <button id="btnAnalyze" class="w-full rounded-xl bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-sm font-semibold">Analyze</button>
-            <div id="anStatus" class="mt-3 text-sm text-slate-400"></div>
-            <div class="mt-4">
-              <div class="text-xs text-slate-400 mb-2">Result</div>
-              <pre id="anOut" class="text-xs whitespace-pre-wrap break-words rounded-xl bg-slate-950/60 border border-slate-800 p-3 min-h-[160px]"></pre>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <footer class="mt-8 text-xs text-slate-500">
-        Tip: first request will load the model (can take a bit).
-      </footer>
-    </div>
-
-    <script>
-      const base = window.location.origin;
-      document.getElementById("baseUrl").textContent = base;
-
-      // Token storage for UI requests (optional)
-      const tokenInput = document.getElementById("tokenInput");
-      const tokenStatus = document.getElementById("tokenStatus");
-      const KEY = "clip_api_token";
-
-      function getToken() {
-        return (localStorage.getItem(KEY) || "").trim();
-      }
-
-      function setToken(v) {
-        const t = (v || "").trim();
-        if (!t) {
-          localStorage.removeItem(KEY);
-        } else {
-          localStorage.setItem(KEY, t);
-        }
-      }
-
-      function authHeader() {
-        const t = getToken();
-        return t ? { Authorization: `Bearer ${t}` } : {};
-      }
-
-      // Init token UI
-      tokenInput.value = getToken();
-      tokenStatus.textContent = getToken() ? "Token loaded from this browser." : "No token set (public mode).";
-      document.getElementById("btnSaveToken").addEventListener("click", () => {
-        setToken(tokenInput.value);
-        tokenStatus.textContent = getToken() ? "Token saved." : "Token cleared.";
-      });
-      document.getElementById("btnClearToken").addEventListener("click", () => {
-        tokenInput.value = "";
-        setToken("");
-        tokenStatus.textContent = "Token cleared.";
-      });
-
-      const fmt = (obj) => JSON.stringify(obj, null, 2);
-      const clipVec = (v) => {
-        if (!Array.isArray(v)) return v;
-        const head = v.slice(0, 8).map(x => Number(x).toFixed(6));
-        return { length: v.length, head };
-      };
-
-      function previewFile(inputEl, imgEl, emptyEl) {
-        const f = inputEl.files && inputEl.files[0];
-        if (!f) {
-          imgEl.classList.add("hidden");
-          emptyEl.classList.remove("hidden");
-          imgEl.src = "";
-          return;
-        }
-        const url = URL.createObjectURL(f);
-        imgEl.src = url;
-        imgEl.classList.remove("hidden");
-        emptyEl.classList.add("hidden");
-      }
-
-      // Encode Text
-      document.getElementById("btnText").addEventListener("click", async () => {
-        const text = document.getElementById("textInput").value.trim();
-        const status = document.getElementById("textStatus");
-        const out = document.getElementById("textOut");
-        out.textContent = "";
-        if (!text) { status.textContent = "Please enter text."; return; }
-        status.textContent = "Encoding...";
-        try {
-          const fd = new FormData();
-          fd.append("text", text);
-          const r = await fetch(`${base}/encode-text`, { method: "POST", body: fd, headers: authHeader() });
-          const body = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
-          out.textContent = fmt({ embedding: clipVec(body.embedding) });
-          status.textContent = "Done.";
-        } catch (e) {
-          status.textContent = `Error: ${e.message}`;
-        }
-      });
-
-      // Encode Image
-      const imgFile = document.getElementById("imgFile");
-      imgFile.addEventListener("change", () => previewFile(imgFile, document.getElementById("imgPreview"), document.getElementById("imgEmpty")));
-      document.getElementById("btnImg").addEventListener("click", async () => {
-        const status = document.getElementById("imgStatus");
-        const out = document.getElementById("imgOut");
-        out.textContent = "";
-        const f = imgFile.files && imgFile.files[0];
-        if (!f) { status.textContent = "Choose an image first."; return; }
-        status.textContent = "Encoding...";
-        try {
-          const fd = new FormData();
-          fd.append("file", f);
-          const r = await fetch(`${base}/encode-image`, { method: "POST", body: fd, headers: authHeader() });
-          const body = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
-          out.textContent = fmt({ embedding: clipVec(body.embedding) });
-          status.textContent = "Done.";
-        } catch (e) {
-          status.textContent = `Error: ${e.message}`;
-        }
-      });
-
-      // Similarity
-      const sim1 = document.getElementById("simFile1");
-      const sim2 = document.getElementById("simFile2");
-      sim1.addEventListener("change", () => previewFile(sim1, document.getElementById("simPrev1"), document.getElementById("simEmpty1")));
-      sim2.addEventListener("change", () => previewFile(sim2, document.getElementById("simPrev2"), document.getElementById("simEmpty2")));
-
-      document.getElementById("btnSim").addEventListener("click", async () => {
-        const status = document.getElementById("simStatus");
-        const f1 = sim1.files && sim1.files[0];
-        const f2 = sim2.files && sim2.files[0];
-        const scoreEl = document.getElementById("simScore");
-        if (!f1 || !f2) { status.textContent = "Select both images."; return; }
-        status.textContent = "Computing...";
-        scoreEl.textContent = "—";
-        try {
-          const fd = new FormData();
-          fd.append("file1", f1);
-          fd.append("file2", f2);
-          const r = await fetch(`${base}/similarity`, { method: "POST", body: fd, headers: authHeader() });
-          const body = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
-          scoreEl.textContent = Number(body.similarity).toFixed(6);
-          status.textContent = "Done.";
-        } catch (e) {
-          status.textContent = `Error: ${e.message}`;
-        }
-      });
-
-      // Analyze Image (CLIP + OCR + Barcode)
-      const anFile = document.getElementById("anFile");
-      anFile.addEventListener("change", () => previewFile(anFile, document.getElementById("anPrev"), document.getElementById("anEmpty")));
-
-      document.getElementById("btnAnalyze").addEventListener("click", async () => {
-        const status = document.getElementById("anStatus");
-        const out = document.getElementById("anOut");
-        out.textContent = "";
-
-        const f = anFile.files && anFile.files[0];
-        if (!f) { status.textContent = "Choose an image first."; return; }
-
-        const doOcr = !!document.getElementById("anDoOcr").checked;
-        const doBarcode = !!document.getElementById("anDoBarcode").checked;
-        const ocrLang = (document.getElementById("anOcrLang").value || "eng").trim() || "eng";
-        const ocrPsm = (document.getElementById("anOcrPsm").value || "6").trim() || "6";
-
-        status.textContent = "Analyzing...";
-        try {
-          const fd = new FormData();
-          fd.append("file", f);
-          fd.append("doOcr", String(doOcr));
-          fd.append("doBarcode", String(doBarcode));
-          fd.append("ocrLang", ocrLang);
-          fd.append("ocrPsm", ocrPsm);
-
-          const r = await fetch(`${base}/analyze-image`, { method: "POST", body: fd, headers: authHeader() });
-          const body = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(body?.detail || `HTTP ${r.status}`);
-
-          const ocrText = body?.ocr?.fullText || null;
-          const ocrWords = (body?.ocr?.words || []);
-          const barcodes = (body?.barcode?.barcodes || []);
-
-          out.textContent = fmt({
-            requestId: body.requestId,
-            embedding: clipVec(body.embedding),
-            ocr: {
-              enabled: doOcr,
-              fullText: ocrText,
-              wordCount: Array.isArray(ocrWords) ? ocrWords.length : 0,
-              error: body.ocrError || null,
-              meta: body?.ocr?.meta || null,
+def health(request: Request):
+    store_health = get_repository().health()
+    overall_status = "ok" if store_health.get("ok", False) else "degraded"
+    return with_request_id(
+        request,
+        {
+            "status": overall_status,
+            "dependencies": {
+                "model": model_health(),
+                "store": store_health,
             },
-            barcode: {
-              enabled: doBarcode,
-              barcodes,
-              error: body.barcodeError || null,
-              meta: body?.barcode?.meta || null,
-            },
-            governance: body.governance || null,
-          });
-
-          status.textContent = "Done.";
-        } catch (e) {
-          status.textContent = `Error: ${e.message}`;
-        }
-      });
-    </script>
-  </body>
-</html>
-"""
+        },
+    )
 
 
 @app.get("/ui", response_class=HTMLResponse)
@@ -569,95 +1051,77 @@ def ui():
     return HTMLResponse(UI_HTML)
 
 
-# ---------------------------------------------------------
-# Image Encoding
-# ---------------------------------------------------------
 @app.post("/encode-image")
 async def encode_image(
+    request: Request,
     file: Optional[UploadFile] = File(default=None),
     image: Optional[UploadFile] = File(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
+    started = time.time()
+    endpoint = "/encode-image"
     require_auth(authorization)
-    model, processor = load_model()
-
     upload = file or image
     if upload is None:
-        raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
-
-    pil_image = Image.open(io.BytesIO(await upload.read())).convert("RGB")
-    inputs = processor(images=pil_image, return_tensors="pt")
-
-    with torch.no_grad():
-        embedding = model.get_image_features(**inputs)
-
-    embedding = _normalize_embedding(embedding)
-    return {"embedding": embedding.squeeze().tolist()}
+        raise HTTPException(status_code=400, detail=problem_detail("missing_image", "No image uploaded. Use form field 'file' or 'image'."))
+    _, pil_image = await read_image_upload(upload, "file")
+    response = with_request_id(request, {"embedding": image_embedding_for(pil_image)})
+    record_latency_metric(endpoint, started)
+    record_request_metric(endpoint, 200)
+    return response
 
 
-# ---------------------------------------------------------
-# Text Encoding
-# ---------------------------------------------------------
 @app.post("/encode-text")
 async def encode_text(
+    request: Request,
     text: Optional[str] = Form(default=None),
     queryText: Optional[str] = Form(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
+    started = time.time()
+    endpoint = "/encode-text"
     require_auth(authorization)
-    model, processor = load_model()
-
-    value = (text or queryText or "").strip()
+    value = compact_text(text or queryText, limit=2000)
     if not value:
-        raise HTTPException(status_code=400, detail="No text provided. Use form field 'text' (or 'queryText').")
-
-    inputs = processor(text=[value], return_tensors="pt", padding=True)
-
-    with torch.no_grad():
-        embedding = model.get_text_features(**inputs)
-
-    embedding = _normalize_embedding(embedding)
-    return {"embedding": embedding.squeeze().tolist()}
+        raise HTTPException(status_code=400, detail=problem_detail("missing_text", "No text provided. Use form field 'text' or 'queryText'."))
+    response = with_request_id(request, {"embedding": text_embedding_for(value)})
+    record_latency_metric(endpoint, started)
+    record_request_metric(endpoint, 200)
+    return response
 
 
-# ---------------------------------------------------------
-# Image Similarity
-# ---------------------------------------------------------
 @app.post("/similarity")
 async def similarity(
+    request: Request,
     file1: Optional[UploadFile] = File(default=None),
     file2: Optional[UploadFile] = File(default=None),
     image1: Optional[UploadFile] = File(default=None),
     image2: Optional[UploadFile] = File(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
+    started = time.time()
+    endpoint = "/similarity"
     require_auth(authorization)
-    model, processor = load_model()
-
-    u1 = file1 or image1
-    u2 = file2 or image2
-    if u1 is None or u2 is None:
-        raise HTTPException(status_code=400, detail="Two images required. Use fields file1/file2 (or image1/image2).")
-
-    img1 = Image.open(u1.file).convert("RGB")
-    img2 = Image.open(u2.file).convert("RGB")
-
-    inputs = processor(images=[img1, img2], return_tensors="pt")
-
-    with torch.no_grad():
-        emb = model.get_image_features(**inputs)
-
-    emb = _normalize_embedding(emb)
-    sim = float(torch.mm(emb[0:1], emb[1:2].T))
-
-    return {"similarity": sim}
+    upload_1 = file1 or image1
+    upload_2 = file2 or image2
+    if upload_1 is None or upload_2 is None:
+        raise HTTPException(
+            status_code=400,
+            detail=problem_detail("missing_image", "Two images are required. Use fields file1/file2 or image1/image2."),
+        )
+    _, image_1 = await read_image_upload(upload_1, "file1")
+    _, image_2 = await read_image_upload(upload_2, "file2")
+    embedding_1 = normalize_vectors(image_embedding_for(image_1))[0]
+    embedding_2 = normalize_vectors(image_embedding_for(image_2))[0]
+    response = with_request_id(request, {"similarity": float(np.dot(embedding_1, embedding_2))})
+    record_latency_metric(endpoint, started)
+    record_request_metric(endpoint, 200)
+    return response
 
 
-# ---------------------------------------------------------
-# OCR / Barcode / Match / Items / Audit Logs
-# ---------------------------------------------------------
 @app.post("/analyze-image")
 async def analyze_image(
+    request: Request,
     file: Optional[UploadFile] = File(default=None),
     image: Optional[UploadFile] = File(default=None),
     doOcr: bool = Form(default=True),
@@ -665,439 +1129,301 @@ async def analyze_image(
     ocrLang: str = Form(default="eng"),
     ocrPsm: int = Form(default=6),
     authorization: Optional[str] = Header(default=None),
-    x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
 ):
-    """
-    One-shot analysis for a single image:
-      - CLIP embedding
-      - OCR (Tesseract)
-      - Barcode scan (ZXing)
-    """
-    t0 = time.time()
+    started = time.time()
     endpoint = "/analyze-image"
     require_auth(authorization)
-    model, processor = load_model()
-
     upload = file or image
     if upload is None:
-        if METRIC_REQUESTS is not None:
-            METRIC_REQUESTS.labels(endpoint=endpoint, status="400").inc()
-        raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
-    request_id = _request_id_from_header(x_request_id)
+        raise HTTPException(status_code=400, detail=problem_detail("missing_image", "No image uploaded. Use form field 'file' or 'image'."))
 
-    raw = await _read_upload_bytes(upload)
-    pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
-    input_hash = _sha256_hex(raw)
-    input_meta = {"sha256": input_hash, "bytes": len(raw), "contentType": upload.content_type}
+    raw, pil_image = await read_image_upload(upload, "file")
+    request_id = get_request_id(request)
+    manual_ocr_text = compact_text(request.query_params.get("ocrText"), limit=500)
+    manual_barcodes = []
+    manual_labels: List[str] = []
 
-    # CLIP
-    inputs = processor(images=pil_image, return_tensors="pt")
-    with torch.no_grad():
-        embedding = model.get_image_features(**inputs)
-    embedding = _normalize_embedding(embedding).squeeze().tolist()
+    try:
+        form = await request.form()
+        manual_ocr_text = compact_text(first_value(form, "ocrText", "ocr"), limit=500) or manual_ocr_text
+        manual_barcodes = normalize_barcodes(first_value(form, "barcodeValues", "barcodes"))
+        manual_labels = normalize_string_list(first_value(form, "labels", "tags"))
+    except Exception:
+        pass
 
-    # OCR / Barcode
-    ocr = None
+    ocr_payload = None
     ocr_error = None
     if doOcr:
-        try:
-            ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
-            if METRIC_OCR_OK is not None:
-                METRIC_OCR_OK.labels(lang=str(ocrLang)).inc()
-            store.add_audit_log(
-                event_type="OCR_EXTRACT",
-                request_id=request_id,
-                payload={"meta": ocr.get("meta"), "wordCount": len(ocr.get("words") or []), "fullText": ocr.get("fullText")},
-            )
-        except Exception as e:
-            ocr_error = str(e)
-            if METRIC_OCR_FAIL is not None:
-                METRIC_OCR_FAIL.labels(lang=str(ocrLang)).inc()
-            store.add_audit_log(
-                event_type="OCR_EXTRACT_FAILED",
-                request_id=request_id,
-                payload={"error": ocr_error, "ocrLang": ocrLang, "ocrPsm": int(ocrPsm)},
-            )
+        ocr_payload, ocr_error = run_ocr(pil_image, ocrLang, ocrPsm)
 
-    barcode = None
+    barcode_payload = None
     barcode_error = None
     if doBarcode:
-        try:
-            barcode = scan_barcodes(pil_image)
-            if METRIC_BARCODE_OK is not None:
-                METRIC_BARCODE_OK.inc()
-            store.add_audit_log(
-                event_type="BARCODE_SCAN",
-                request_id=request_id,
-                payload={"meta": barcode.get("meta"), "barcodes": barcode.get("barcodes")},
-            )
-        except Exception as e:
-            barcode_error = str(e)
-            if METRIC_BARCODE_FAIL is not None:
-                METRIC_BARCODE_FAIL.inc()
-            store.add_audit_log(
-                event_type="BARCODE_SCAN_FAILED",
-                request_id=request_id,
-                payload={"error": barcode_error},
-            )
+        barcode_payload, barcode_error = run_barcode_scan(pil_image)
 
-    store.add_audit_log(
-        event_type="IMAGE_ANALYZE",
+    scanned_barcodes = normalize_barcodes((barcode_payload or {}).get("barcodes"))
+    combined_barcodes = merge_barcodes(manual_barcodes, scanned_barcodes)
+    effective_ocr_text = manual_ocr_text or ((ocr_payload or {}).get("fullText"))
+    effective_barcode_values = barcode_values(combined_barcodes)
+
+    get_repository().add_audit_log(
+        "IMAGE_ANALYZE",
+        {
+            "input": {"sha256": sha256_hex(raw), "bytes": len(raw), "contentType": getattr(upload, "content_type", None)},
+            "ocrEnabled": doOcr,
+            "barcodeEnabled": doBarcode,
+            "ocrError": ocr_error,
+            "barcodeError": barcode_error,
+        },
         request_id=request_id,
-        payload={"input": input_meta, "governance": _governance_meta()},
     )
 
-    if METRIC_LATENCY is not None:
-        METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - t0))
-    if METRIC_REQUESTS is not None:
-        METRIC_REQUESTS.labels(endpoint=endpoint, status="200").inc()
-
-    return {
-        "requestId": request_id,
-        "governance": _governance_meta(),
-        "input": input_meta,
-        "embedding": embedding,
-        "ocr": ocr,
-        "ocrError": ocr_error,
-        "barcode": barcode,
-        "barcodeError": barcode_error,
-    }
-
-
-@app.post("/items", status_code=201)
-async def create_item(
-    payload: dict = Body(...),
-    authorization: Optional[str] = Header(default=None),
-    x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
-):
-    """
-    Create an item (store-only).
-
-    This endpoint does NOT compute CLIP/OCR/barcodes. Use compute endpoints first:
-      - /analyze-image (image -> embedding + OCR + barcodes)
-      - /encode-image (image -> embedding)
-    Then POST the resulting data here to persist it.
-    """
-    t0 = time.time()
-    endpoint = "/items:create"
-    require_auth(authorization)
-    request_id = _request_id_from_header(x_request_id)
-
-    if not isinstance(payload, dict):
-        if METRIC_REQUESTS is not None:
-            METRIC_REQUESTS.labels(endpoint=endpoint, status="422").inc()
-        raise HTTPException(status_code=422, detail="Request body must be a JSON object.")
-
-    # Required: name
-    clean_name = ((payload.get("name") or "") if isinstance(payload.get("name"), str) else "").strip()
-    if not clean_name:
-        if METRIC_REQUESTS is not None:
-            METRIC_REQUESTS.labels(endpoint=endpoint, status="422").inc()
-        raise HTTPException(status_code=422, detail="Field 'name' must be a non-empty string.")
-
-    # Required: embedding
-    emb = payload.get("clipEmbedding", None)
-    if emb is None:
-        # Back-compat / internal name
-        emb = payload.get("embedding", None)
-    if not isinstance(emb, list) or not emb:
-        if METRIC_REQUESTS is not None:
-            METRIC_REQUESTS.labels(endpoint=endpoint, status="422").inc()
-        raise HTTPException(status_code=422, detail="Field 'clipEmbedding' (array of numbers) is required.")
-    if len(emb) > 8192:
-        raise HTTPException(status_code=422, detail="Field 'clipEmbedding' is too large.")
-    try:
-        emb = [float(x) for x in emb]
-    except Exception as e:
-        raise HTTPException(status_code=422, detail="Field 'clipEmbedding' must contain only numbers.") from e
-
-    # Optional: description
-    description = payload.get("description")
-    if description is not None and not isinstance(description, str):
-        raise HTTPException(status_code=422, detail="Field 'description' must be a string.")
-    description = (description.strip() if isinstance(description, str) and description.strip() else None)
-
-    # Optional: OCR (either flattened or nested)
-    ocr_text = None
-    ocr_words = None
-    if "ocr" in payload and isinstance(payload.get("ocr"), dict):
-        ocr_text = payload["ocr"].get("fullText")
-        ocr_words = payload["ocr"].get("words")
-    else:
-        ocr_text = payload.get("ocrText")
-        ocr_words = payload.get("ocrWords")
-    if ocr_text is not None and not isinstance(ocr_text, str):
-        raise HTTPException(status_code=422, detail="Field 'ocr.fullText' (or 'ocrText') must be a string.")
-    if ocr_words is not None and not isinstance(ocr_words, list):
-        raise HTTPException(status_code=422, detail="Field 'ocr.words' (or 'ocrWords') must be an array.")
-
-    # Optional: barcodes
-    barcodes = payload.get("barcodes")
-    if barcodes is not None and not isinstance(barcodes, list):
-        raise HTTPException(status_code=422, detail="Field 'barcodes' must be an array.")
-
-    item = store.create_item(
-        name=clean_name,
-        description=description,
-        clip_embedding=emb,
-        ocr_text=ocr_text,
-        ocr_words=ocr_words,
-        barcodes=barcodes,
-        status="draft",
-    )
-
-    store.add_audit_log(
-        event_type="ITEM_CREATED",
-        item_id=item["id"],
-        request_id=request_id,
-        payload={
-            "name": item["name"],
-            "description": item["description"],
-            "status": item["status"],
-            "input": {"provided": {"hasOcr": ocr_text is not None or ocr_words is not None, "hasBarcodes": barcodes is not None}},
-            "governance": _governance_meta(),
+    response = with_request_id(
+        request,
+        {
+            "governance": governance_meta(ocrEnabled=doOcr, barcodeEnabled=doBarcode),
+            "image": image_info(pil_image, upload),
+            "input": {"sha256": sha256_hex(raw), "bytes": len(raw), "contentType": getattr(upload, "content_type", None)},
+            "embedding": image_embedding_for(pil_image),
+            "ocr": ocr_payload,
+            "ocrError": ocr_error,
+            "barcode": {"barcodes": combined_barcodes, "meta": (barcode_payload or {}).get("meta")} if combined_barcodes or barcode_payload else None,
+            "barcodeError": barcode_error,
+            "signals": compact_signals(effective_ocr_text, effective_barcode_values, manual_labels),
         },
     )
-    if ocr_text is not None:
-        store.add_audit_log(
-            event_type="OCR_EXTRACT",
-            item_id=item["id"],
-            request_id=request_id,
-            payload={"meta": {}, "wordCount": len(ocr_words or []), "fullText": ocr_text},
-        )
-    if barcodes is not None:
-        store.add_audit_log(
-            event_type="BARCODE_SCAN",
-            item_id=item["id"],
-            request_id=request_id,
-            payload={"barcodes": barcodes},
-        )
+    record_latency_metric(endpoint, started)
+    record_request_metric(endpoint, 200)
+    return response
 
-    if METRIC_LATENCY is not None:
-        METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - t0))
-    if METRIC_REQUESTS is not None:
-        METRIC_REQUESTS.labels(endpoint=endpoint, status="201").inc()
 
-    return {"requestId": request_id, "governance": _governance_meta(), "item": item}
+@app.post("/items")
+async def upsert_item(request: Request):
+    started = time.time()
+    endpoint = "/items"
+    require_auth(request.headers.get("Authorization"))
+    parsed_payload = await parse_items_request(request)
+    upload = parsed_payload.pop("upload", None)
+    normalized_patch = parse_item_payload(parsed_payload)
+
+    existing = get_repository().get_item(normalized_patch["id"])
+    stored_item = prepare_item_for_storage(existing, normalized_patch)
+
+    if upload is not None:
+        _, pil_image = await read_image_upload(upload, "file")
+        stored_item["embedding"] = image_embedding_for(pil_image)
+        stored_item["clipEmbedding"] = stored_item["embedding"]
+        stored_item["image"] = image_info(pil_image, upload)
+        stored_item["eligibleForMatching"] = bool(stored_item.get("released")) and True
+        stored_item["status"] = "released" if stored_item["eligibleForMatching"] else "stored"
+
+    saved_item = get_repository().upsert_item(stored_item)
+    get_repository().add_audit_log(
+        "ITEM_UPSERT",
+        {"status": saved_item.get("status"), "released": saved_item.get("released"), "hasEmbedding": bool(saved_item.get("embedding"))},
+        item_id=saved_item["id"],
+        request_id=get_request_id(request),
+    )
+
+    response = with_request_id(request, {"governance": governance_meta(), "item": serialize_item(saved_item, include_embedding=True)})
+    record_latency_metric(endpoint, started)
+    record_request_metric(endpoint, 200)
+    return response
 
 
 @app.get("/items")
 def list_items(
+    request: Request,
     status: Optional[str] = Query(default=None),
     limit: int = Query(default=500, ge=1, le=5000),
     authorization: Optional[str] = Header(default=None),
 ):
     require_auth(authorization)
-    if status is not None:
-        s = status.strip().lower()
-        if s and s not in _ALLOWED_ITEM_STATUSES:
-            raise HTTPException(status_code=400, detail=f"Invalid status. Use one of: {sorted(_ALLOWED_ITEM_STATUSES)}")
-        status = s or None
-    return {"items": store.list_items(status=status, limit=limit)}
+    items = [serialize_item(item, include_embedding=True) for item in get_repository().list_items(status=status, limit=limit)]
+    return with_request_id(request, {"items": items})
 
 
 @app.get("/items/{item_id}")
-def get_item(
-    item_id: str,
-    authorization: Optional[str] = Header(default=None),
-):
+def get_item(request: Request, item_id: str, authorization: Optional[str] = Header(default=None)):
     require_auth(authorization)
-    try:
-        return {"item": store.get_item(item_id)}
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Item not found")
+    item = get_repository().get_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
+    return with_request_id(request, {"item": serialize_item(item, include_embedding=True)})
 
 
 @app.post("/items/{item_id}/release")
-def release_item(
-    item_id: str,
-    authorization: Optional[str] = Header(default=None),
-    x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
-):
+def release_item(request: Request, item_id: str, authorization: Optional[str] = Header(default=None)):
+    started = time.time()
+    endpoint = "/items/release"
     require_auth(authorization)
-    request_id = _request_id_from_header(x_request_id)
-    try:
-        item = store.set_item_status(item_id, status="released", released=True)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Item not found")
-
-    store.add_audit_log(
-        event_type="ITEM_RELEASE",
+    existing = get_repository().get_item(item_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
+    if not existing.get("embedding"):
+        raise HTTPException(
+            status_code=409,
+            detail=problem_detail("item_not_matchable", f"Item '{item_id}' cannot be released without an embedding or image."),
+        )
+    existing["released"] = True
+    existing["eligibleForMatching"] = True
+    existing["status"] = "released"
+    existing["releasedAt"] = existing.get("releasedAt") or now_iso()
+    existing["updatedAt"] = now_iso()
+    saved_item = get_repository().upsert_item(existing)
+    get_repository().add_audit_log(
+        "ITEM_RELEASE",
+        {"status": "released", "releasedAt": saved_item.get("releasedAt")},
         item_id=item_id,
-        request_id=request_id,
-        payload={"status": "released", "releasedAt": item.get("releasedAt")},
+        request_id=get_request_id(request),
     )
-    return {"requestId": request_id, "item": item}
+    response = with_request_id(request, {"item": serialize_item(saved_item, include_embedding=True)})
+    record_latency_metric(endpoint, started)
+    record_request_metric(endpoint, 200)
+    return response
 
 
 @app.get("/audit-logs")
 def list_audit_logs(
-    itemId: Optional[str] = None,
-    limit: int = 200,
-    offset: int = 0,
+    request: Request,
+    itemId: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     authorization: Optional[str] = Header(default=None),
 ):
     require_auth(authorization)
-    return {"logs": store.list_audit_logs(item_id=itemId, limit=limit, offset=offset)}
+    logs = get_repository().list_audit_logs(item_id=itemId, limit=limit, offset=offset)
+    return with_request_id(request, {"logs": logs})
 
 
 @app.post("/match")
-async def match_top_k(
-    file: Optional[UploadFile] = File(default=None),
-    image: Optional[UploadFile] = File(default=None),
-    queryText: Optional[str] = Form(default=None),
-    doOcr: bool = Form(default=True),
-    doBarcode: bool = Form(default=True),
-    ocrLang: str = Form(default="eng"),
-    ocrPsm: int = Form(default=6),
-    k: int = Form(default=5),
-    status: str = Form(default="released"),
-    authorization: Optional[str] = Header(default=None),
-    x_request_id: Optional[str] = Header(default=None, alias="X-Request-Id"),
-):
-    """
-    Top-K matching against stored items using CLIP cosine similarity.
-    Adds explainability signals from:
-      - OCR token overlap (queryText vs item.ocrText)
-      - Barcode intersection (query image scan vs item barcodes)
-    """
-    t0 = time.time()
+async def match(request: Request):
+    started = time.time()
     endpoint = "/match"
-    require_auth(authorization)
-    model, processor = load_model()
-    request_id = _request_id_from_header(x_request_id)
+    require_auth(request.headers.get("Authorization"))
+    form = await request.form()
 
-    upload = file or image
-    if upload is None:
-        if METRIC_REQUESTS is not None:
-            METRIC_REQUESTS.labels(endpoint=endpoint, status="400").inc()
-        raise HTTPException(status_code=400, detail="No file uploaded. Use form field 'file' (or 'image').")
-    raw = await _read_upload_bytes(upload)
-    pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
-    input_hash = _sha256_hex(raw)
-
-    # Query embedding
-    inputs = processor(images=pil_image, return_tensors="pt")
-    with torch.no_grad():
-        q_emb_t = model.get_image_features(**inputs)
-    q_emb = _normalize_embedding(q_emb_t).squeeze().tolist()
-
-    # Optional query OCR / Barcode signals
-    q_ocr = None
-    if doOcr:
-        try:
-            q_ocr = extract_ocr(pil_image, lang=ocrLang, psm=int(ocrPsm))
-            if METRIC_OCR_OK is not None:
-                METRIC_OCR_OK.labels(lang=str(ocrLang)).inc()
-            store.add_audit_log(
-                event_type="OCR_EXTRACT",
-                request_id=request_id,
-                payload={"scope": "query", "meta": q_ocr.get("meta"), "wordCount": len(q_ocr.get("words") or []), "fullText": q_ocr.get("fullText")},
-            )
-        except Exception as e:
-            if METRIC_OCR_FAIL is not None:
-                METRIC_OCR_FAIL.labels(lang=str(ocrLang)).inc()
-            store.add_audit_log(
-                event_type="OCR_EXTRACT_FAILED",
-                request_id=request_id,
-                payload={"scope": "query", "error": str(e), "ocrLang": ocrLang, "ocrPsm": int(ocrPsm)},
-            )
-
-    q_barcode = None
-    if doBarcode:
-        try:
-            q_barcode = scan_barcodes(pil_image)
-            if METRIC_BARCODE_OK is not None:
-                METRIC_BARCODE_OK.inc()
-            store.add_audit_log(
-                event_type="BARCODE_SCAN",
-                request_id=request_id,
-                payload={"scope": "query", "barcodes": q_barcode.get("barcodes"), "meta": q_barcode.get("meta")},
-            )
-        except Exception as e:
-            if METRIC_BARCODE_FAIL is not None:
-                METRIC_BARCODE_FAIL.inc()
-            store.add_audit_log(event_type="BARCODE_SCAN_FAILED", request_id=request_id, payload={"scope": "query", "error": str(e)})
-
-    # Candidate items
-    k = max(1, min(int(k), 50))
-    candidates = store.list_item_embeddings(status=status, limit=5000)
-
-    scored = []
-    for it in candidates:
-        s = cosine_similarity(q_emb, it.get("embedding") or [])
-        scored.append((s, it))
-    scored.sort(key=lambda t: t[0], reverse=True)
-    top = scored[:k]
-
-    sims = [float(s) for s, _ in top]
-    confs = softmax_confidences(sims, temperature=CONF_TEMPERATURE)
-
-    # No-match decisioning
-    top_score = sims[0] if sims else 0.0
-    second_score = sims[1] if len(sims) > 1 else None
-    no_match, no_match_meta = should_return_no_match(
-        top_score=top_score,
-        second_score=second_score,
-        min_score=CONF_MIN_SCORE,
-        min_margin=CONF_MIN_MARGIN,
-    )
-    if no_match and METRIC_MATCH_NO_MATCH is not None:
-        METRIC_MATCH_NO_MATCH.inc()
-
-    results = []
-    for (s, it), conf in zip(top, confs):
-        expl = build_explanation(
-            similarity=float(s),
-            query_text=(queryText or (q_ocr or {}).get("fullText")),
-            item_ocr_text=it.get("ocrText"),
-            query_barcodes=(q_barcode or {}).get("barcodes"),
-            item_barcodes=it.get("barcodes"),
-        )
-        results.append(
-            {
-                "item": {
-                    "id": it.get("id"),
-                    "name": it.get("name"),
-                    "description": it.get("description"),
-                    "status": it.get("status"),
-                    "ocrText": it.get("ocrText"),
-                    "barcodes": it.get("barcodes") or [],
-                },
-                "score": float(s),
-                "confidence": float(conf),
-                "explanation": expl,
-            }
+    upload_value = first_value(form, "file", "image")
+    upload = upload_value if is_upload(upload_value) else None
+    text = compact_text(first_value(form, "text", "queryText", "query"), limit=2000)
+    if upload is None and not text:
+        raise HTTPException(
+            status_code=400,
+            detail=problem_detail("invalid_match_request", "Provide an image file, text query, or both."),
         )
 
-    store.add_audit_log(
-        event_type="AI_MATCH_GENERATION",
-        request_id=request_id,
-        payload={
-            "k": k,
-            "statusFilter": status,
-            "queryText": (queryText or None),
-            "resultIds": [r["item"]["id"] for r in results],
-            "input": {"sha256": input_hash, "bytes": len(raw), "contentType": upload.content_type},
+    do_ocr = normalize_bool(form.get("doOcr"), default=True)
+    do_barcode = normalize_bool(form.get("doBarcode"), default=True)
+    ocr_lang = compact_text(str(form.get("ocrLang") or "eng"), limit=32) or "eng"
+    ocr_psm = int(form.get("ocrPsm") or 6)
+    top_k = parse_top_k(first_value(form, "topK", "k", "limit"))
+    status_filter = compact_text(str(form.get("status") or "released"), limit=32) or "released"
+    manual_ocr_text = compact_text(first_value(form, "ocrText", "ocr"), limit=500)
+    manual_barcodes = normalize_barcodes(first_value(form, "barcodeValues", "barcodes"))
+    manual_labels = normalize_string_list(first_value(form, "labels", "tags"))
+
+    query_embeddings: List[List[float]] = []
+    query_image_info = None
+    raw_bytes = None
+    query_ocr_payload = None
+    query_barcode_payload = None
+    query_ocr_error = None
+    query_barcode_error = None
+
+    if upload is not None:
+        raw_bytes, pil_image = await read_image_upload(upload, "file")
+        query_embeddings.append(image_embedding_for(pil_image))
+        query_image_info = image_info(pil_image, upload)
+        if do_ocr:
+            query_ocr_payload, query_ocr_error = run_ocr(pil_image, ocr_lang, ocr_psm)
+        if do_barcode:
+            query_barcode_payload, query_barcode_error = run_barcode_scan(pil_image)
+
+    if text:
+        query_embeddings.append(text_embedding_for(text))
+
+    query_vector = normalize_vectors(np.mean(np.asarray(query_embeddings, dtype=float), axis=0))[0]
+    scanned_barcodes = normalize_barcodes((query_barcode_payload or {}).get("barcodes"))
+    combined_barcodes = merge_barcodes(manual_barcodes, scanned_barcodes)
+    query_barcode_values = barcode_values(combined_barcodes)
+    query_ocr_text = manual_ocr_text or ((query_ocr_payload or {}).get("fullText"))
+
+    if status_filter == "released":
+        candidates = get_repository().list_released_items(limit=5000)
+    else:
+        candidates = [item for item in get_repository().list_items(status=status_filter, limit=5000) if item.get("embedding")]
+
+    ranked: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        if not candidate.get("embedding"):
+            continue
+        candidate_vector = normalize_vectors(candidate["embedding"])[0]
+        score = float(np.dot(query_vector, candidate_vector))
+        ranked.append({"candidate": candidate, "score": score})
+
+    ranked.sort(key=lambda row: row["score"], reverse=True)
+    top_rows = ranked[:top_k]
+    scores = [row["score"] for row in top_rows]
+    confidences = softmax_confidences(scores, temperature=CONF_TEMPERATURE)
+    top_score = scores[0] if scores else 0.0
+    second_score = scores[1] if len(scores) > 1 else None
+    no_match, no_match_meta = should_return_no_match(top_score, second_score, CONF_MIN_SCORE, CONF_MIN_MARGIN)
+
+    results: List[Dict[str, Any]] = []
+    if not no_match:
+        for row, confidence in zip(top_rows, confidences):
+            candidate = row["candidate"]
+            score = row["score"]
+            results.append(
+                {
+                    "item": serialize_item(candidate, include_embedding=False),
+                    "score": round(score, 6),
+                    "confidence": round(float(confidence), 6),
+                    "explanation": match_explanation(candidate, query_ocr_text, combined_barcodes, manual_labels, score),
+                }
+            )
+
+    get_repository().add_audit_log(
+        "AI_MATCH_GENERATION",
+        {
+            "topK": top_k,
+            "statusFilter": status_filter,
+            "queryText": text,
+            "resultIds": [result["item"]["id"] for result in results],
             "decisioning": {"noMatch": no_match, "meta": no_match_meta},
-            "governance": _governance_meta(),
+            "input": None if raw_bytes is None else {"sha256": sha256_hex(raw_bytes), "bytes": len(raw_bytes)},
         },
+        request_id=get_request_id(request),
     )
 
-    if METRIC_LATENCY is not None:
-        METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - t0))
-    if METRIC_REQUESTS is not None:
-        METRIC_REQUESTS.labels(endpoint=endpoint, status="200").inc()
+    query_type_parts: List[str] = []
+    if upload is not None:
+        query_type_parts.append("image")
+    if text:
+        query_type_parts.append("text")
 
-    return {
-        "requestId": request_id,
-        "governance": _governance_meta(),
-        "decisioning": {"noMatch": no_match, "meta": no_match_meta},
-        "query": {
-            "embedding": q_emb,
-            "queryText": queryText,
-            "ocr": q_ocr,
-            "barcode": q_barcode,
+    response = with_request_id(
+        request,
+        {
+            "governance": governance_meta(
+                releasedOnly=status_filter == "released",
+                topKRequested=top_k,
+                candidatesEvaluated=len(ranked),
+                decisioning={"noMatch": no_match, "meta": no_match_meta},
+            ),
+            "query": {
+                "type": "+".join(query_type_parts),
+                "text": text,
+                "image": query_image_info,
+                "ocr": query_ocr_payload,
+                "ocrError": query_ocr_error,
+                "barcode": {"barcodes": combined_barcodes, "meta": (query_barcode_payload or {}).get("meta")} if combined_barcodes or query_barcode_payload else None,
+                "barcodeError": query_barcode_error,
+                "signals": compact_signals(query_ocr_text, query_barcode_values, manual_labels),
+            },
+            "topK": results,
         },
-        "topK": ([] if no_match else results),
-    }
+    )
+    record_latency_metric(endpoint, started)
+    record_request_metric(endpoint, 200)
+    return response
