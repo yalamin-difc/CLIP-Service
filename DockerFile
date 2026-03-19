@@ -1,11 +1,7 @@
-# Use official Python base image
 FROM python:3.10-slim
-
-# Allow statements and log messages to immediately appear
+ 
 ENV PYTHONUNBUFFERED True
-
-# Install system deps (git for CLIP, tesseract for OCR)
-# Add language packs for multilingual OCR (English/Arabic/French).
+ 
 RUN apt-get update && apt-get install -y \
   git \
   tesseract-ocr \
@@ -13,24 +9,22 @@ RUN apt-get update && apt-get install -y \
   tesseract-ocr-ara \
   tesseract-ocr-fra \
   && rm -rf /var/lib/apt/lists/*
-
-# Set work dir
+ 
+RUN useradd -m -u 10001 appuser
+ 
 WORKDIR /app
-
-# Copy dependencies
+ 
 COPY requirements.txt /app/
-
-# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy app code
+ 
 COPY . /app
-
-# Cloud Run provides PORT env variable
+ 
+ENV HF_HOME=/tmp/huggingface
+ENV TRANSFORMERS_CACHE=/tmp/huggingface
+ 
+USER appuser
+ 
 ENV PORT=8080
-
-# Expose port (for local testing)
 EXPOSE 8080
-
-# Run FastAPI with uvicorn
+ 
 CMD exec uvicorn app:app --host 0.0.0.0 --port $PORT
