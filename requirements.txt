@@ -2,6 +2,7 @@
 fastapi
 uvicorn
 pillow
+httpx
 
 # CPU versions (Cloud Run friendly)
 # NOTE: transformers now requires torch>=2.6 for safe torch.load behavior.
