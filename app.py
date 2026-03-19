@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -17,7 +17,6 @@ import os
 import anyio
 
 from barcode_service import scan_barcodes
-from match_service import build_explanation, cosine_similarity, should_return_no_match, softmax_confidences
 from ocr_service import extract_ocr
 
 try:
@@ -105,10 +104,7 @@ async def request_id_middleware(request: Request, call_next):
     rid = (request.headers.get("X-Request-Id") or "").strip() or str(uuid.uuid4())
     request.state.request_id = rid
     response = await call_next(request)
-    try:
-        response.headers["X-Request-Id"] = rid
-    except Exception:
-        pass
+    response.headers["X-Request-Id"] = rid
     return response
 
 
