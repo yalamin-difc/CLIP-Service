@@ -13,12 +13,14 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
+import anyio
 import numpy as np
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 try:  # pragma: no cover - optional runtime dependency
     from barcode_service import scan_barcodes as _scan_barcodes
@@ -59,6 +61,9 @@ MONGODB_AUDIT_COLLECTION = os.environ.get("MONGODB_AUDIT_COLLECTION", "audit_log
 CONF_TEMPERATURE = float(os.environ.get("CONF_TEMPERATURE", "0.07"))
 CONF_MIN_SCORE = float(os.environ.get("CONF_MIN_SCORE", "0.22"))
 CONF_MIN_MARGIN = float(os.environ.get("CONF_MIN_MARGIN", "0.03"))
+OCR_TIMEOUT_MS = int(os.environ.get("OCR_TIMEOUT_MS", "4000"))
+BARCODE_TIMEOUT_MS = int(os.environ.get("BARCODE_TIMEOUT_MS", "2500"))
+SCORING_VERSION = "clip-match-v1"
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,10 +78,179 @@ if Counter is not None:
     METRIC_REQUESTS = Counter("clip_service_requests_total", "Requests", ["endpoint", "status"])
     METRIC_LATENCY = Histogram("clip_service_request_latency_seconds", "Request latency", ["endpoint"])
     METRIC_MODEL_LOADED = Gauge("clip_service_model_loaded", "Model loaded (1/0)")
+    METRIC_MATCH_RESULTS = Counter("clip_service_match_results_total", "Match outcomes", ["outcome"])
+    METRIC_MATCH_FAILURES = Counter("clip_service_match_failures_total", "Match failures", ["code"])
 else:  # pragma: no cover
     METRIC_REQUESTS = None
     METRIC_LATENCY = None
     METRIC_MODEL_LOADED = None
+    METRIC_MATCH_RESULTS = None
+    METRIC_MATCH_FAILURES = None
+
+
+class StrictBaseModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ThresholdsModel(StrictBaseModel):
+    minScore: float = Field(default=CONF_MIN_SCORE, ge=-1.0, le=1.0)
+    minMargin: float = Field(default=CONF_MIN_MARGIN, ge=0.0, le=2.0)
+    temperature: float = Field(default=CONF_TEMPERATURE, gt=0.0, le=100.0)
+
+
+class MatchRequestModel(StrictBaseModel):
+    text: Optional[str] = None
+    topK: int = Field(default=DEFAULT_TOP_K, ge=1, le=MAX_TOP_K)
+    status: str = "released"
+    thresholds: ThresholdsModel = Field(default_factory=ThresholdsModel)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    ocrText: Optional[str] = None
+    barcodeValues: List[str] = Field(default_factory=list)
+    labels: List[str] = Field(default_factory=list)
+    doOcr: bool = True
+    doBarcode: bool = True
+    ocrLang: str = "eng"
+    ocrPsm: int = Field(default=6, ge=1, le=13)
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        normalized = (value or "released").strip().lower()
+        if normalized not in {"released", "stored", "draft", "archived"}:
+            raise ValueError("status must be one of: released, stored, draft, archived")
+        return normalized
+
+
+class QueryImageModel(StrictBaseModel):
+    filename: Optional[str] = None
+    width: int
+    height: int
+    mode: str
+
+
+class QueryBarcodeModel(StrictBaseModel):
+    barcodes: List[Dict[str, Any]] = Field(default_factory=list)
+    meta: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class QueryOcrModel(StrictBaseModel):
+    fullText: Optional[str] = None
+    words: List[Dict[str, Any]] = Field(default_factory=list)
+    meta: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class QuerySignalsModel(StrictBaseModel):
+    ocr: Optional[Dict[str, Any]] = None
+    barcode: Optional[Dict[str, Any]] = None
+    labels: List[str] = Field(default_factory=list)
+
+
+class MatchQueryModel(StrictBaseModel):
+    type: str
+    modalities: List[str] = Field(default_factory=list)
+    text: Optional[str] = None
+    image: Optional[QueryImageModel] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    thresholds: ThresholdsModel
+    ocrText: Optional[str] = None
+    ocr: QueryOcrModel = Field(default_factory=QueryOcrModel)
+    barcodeValues: List[str] = Field(default_factory=list)
+    barcode: QueryBarcodeModel = Field(default_factory=QueryBarcodeModel)
+    labels: List[str] = Field(default_factory=list)
+    signals: QuerySignalsModel
+
+
+class MatchDecisionModel(StrictBaseModel):
+    noMatch: bool
+    reason: str
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MatchGovernanceModel(StrictBaseModel):
+    engine: str = "clip"
+    serviceVersion: str
+    modelId: str
+    confidence: Dict[str, float]
+    scoringVersion: str
+    thresholds: ThresholdsModel
+    releasedOnly: bool
+    topKRequested: int
+    candidatesEvaluated: int
+    latencyMs: int
+    decision: MatchDecisionModel
+
+
+class MatchExplanationSimilarityModel(StrictBaseModel):
+    cosine: float
+    band: str
+
+
+class MatchExplanationOverlapModel(StrictBaseModel):
+    matchedTerms: List[str] = Field(default_factory=list)
+    matchCount: int = 0
+
+
+class MatchExplanationValueMatchModel(StrictBaseModel):
+    matchedValues: List[str] = Field(default_factory=list)
+    matchCount: int = 0
+
+
+class MatchModelMetadataModel(StrictBaseModel):
+    engine: str = "clip"
+    modelId: str
+    serviceVersion: str
+    scoringVersion: str
+
+
+class MatchExplanationModel(StrictBaseModel):
+    reason: str
+    summary: str
+    scoreBand: str
+    signals: Dict[str, Any] = Field(default_factory=dict)
+    similarity: MatchExplanationSimilarityModel
+    ocr: MatchExplanationOverlapModel
+    barcode: MatchExplanationValueMatchModel
+    labels: MatchExplanationValueMatchModel
+    model: MatchModelMetadataModel
+
+
+class MatchItemModel(StrictBaseModel):
+    id: str
+    title: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    released: bool = False
+    eligibleForMatching: bool = False
+    ocrText: Optional[str] = None
+    ocr: Optional[Dict[str, Any]] = None
+    ocrWords: List[Dict[str, Any]] = Field(default_factory=list)
+    barcodes: List[Dict[str, Any]] = Field(default_factory=list)
+    barcodeValues: List[str] = Field(default_factory=list)
+    labels: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    image: Optional[Dict[str, Any]] = None
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    releasedAt: Optional[str] = None
+
+
+class MatchCandidateModel(StrictBaseModel):
+    candidateId: str
+    item: MatchItemModel
+    score: float
+    confidence: float
+    explanation: MatchExplanationModel
+
+
+class MatchResponseModel(StrictBaseModel):
+    requestId: str
+    governance: MatchGovernanceModel
+    query: MatchQueryModel
+    decision: MatchDecisionModel
+    topK: List[MatchCandidateModel] = Field(default_factory=list)
 
 
 def now_iso() -> str:
@@ -144,6 +318,7 @@ def error_response(
 async def request_id_middleware(request: Request, call_next):
     request_id = request.headers.get(REQUEST_ID_HEADER, "").strip() or str(uuid.uuid4())
     request.state.request_id = request_id
+    request.state.request_started_at = time.time()
     response = await call_next(request)
     response.headers[REQUEST_ID_HEADER] = request_id
     return response
@@ -161,16 +336,27 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     elif isinstance(exc.detail, list):
         message = "Request failed."
         details = exc.detail
+    record_request_metric(request.url.path, exc.status_code)
+    if request.url.path == "/match":
+        logger.warning("Match request failed [%s]: %s", code, message)
+        record_match_failure(code)
     return error_response(request, exc.status_code, code, message, details)
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    record_request_metric(request.url.path, 422)
+    if request.url.path == "/match":
+        record_match_failure("validation_error")
     return error_response(request, 422, "validation_error", "Request validation failed.", exc.errors())
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
+    record_request_metric(request.url.path, 500)
+    logger.exception("Unhandled error on %s", request.url.path)
+    if request.url.path == "/match":
+        record_match_failure("internal_error")
     return error_response(request, 500, "internal_error", "An unexpected error occurred.")
 
 
@@ -182,6 +368,23 @@ def record_request_metric(endpoint: str, status: int) -> None:
 def record_latency_metric(endpoint: str, started_at: float) -> None:
     if METRIC_LATENCY is not None:
         METRIC_LATENCY.labels(endpoint=endpoint).observe(max(0.0, time.time() - started_at))
+
+
+def record_match_outcome(outcome: str) -> None:
+    if METRIC_MATCH_RESULTS is not None:
+        METRIC_MATCH_RESULTS.labels(outcome=outcome).inc()
+
+
+def record_match_failure(code: str) -> None:
+    if METRIC_MATCH_FAILURES is not None:
+        METRIC_MATCH_FAILURES.labels(code=code).inc()
+
+
+def request_latency_ms(request: Request) -> int:
+    started_at = getattr(request.state, "request_started_at", None)
+    if started_at is None:
+        return 0
+    return int(max(0.0, (time.time() - started_at) * 1000))
 
 
 def governance_meta(**extra: Any) -> Dict[str, Any]:
@@ -295,6 +498,12 @@ def normalize_mapping(value: Any, field_name: str) -> Dict[str, Any]:
     raise HTTPException(status_code=400, detail=problem_detail("invalid_payload", f"Field '{field_name}' must be an object."))
 
 
+def parse_optional_object(value: Any, field_name: str) -> Dict[str, Any]:
+    if value in (None, ""):
+        return {}
+    return normalize_mapping(value, field_name)
+
+
 def parse_top_k(value: Any) -> int:
     if value is None or value == "":
         return DEFAULT_TOP_K
@@ -360,6 +569,12 @@ def normalize_barcodes(value: Any) -> List[Dict[str, Any]]:
         seen.add(key)
         normalized.append(barcode)
     return normalized
+
+
+def barcode_overlap_values(query_barcodes: List[Dict[str, Any]], item_barcodes: List[Dict[str, Any]]) -> List[str]:
+    query_barcode_map = {value.lower(): value for value in barcode_values(query_barcodes)}
+    item_barcode_map = {value.lower(): value for value in barcode_values(item_barcodes)}
+    return [item_barcode_map[key] for key in sorted(query_barcode_map.keys() & item_barcode_map.keys())][:3]
 
 
 def barcode_values(barcodes: List[Dict[str, Any]]) -> List[str]:
@@ -519,20 +734,28 @@ def text_embedding_for(text: str) -> List[float]:
     return [float(value) for value in normalize_vectors(features)[0].tolist()]
 
 
-def run_ocr(image: Image.Image, lang: str, psm: int) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def run_ocr(image: Image.Image, lang: str, psm: int) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     if _extract_ocr is None:
         return None, "OCR service is not available."
     try:
-        return _extract_ocr(image, lang=lang, psm=int(psm)), None
+        with anyio.fail_after(max(0.1, float(OCR_TIMEOUT_MS) / 1000.0)):
+            result = await anyio.to_thread.run_sync(_extract_ocr, image, lang=lang, psm=int(psm))
+        return result, None
+    except TimeoutError:
+        return None, "OCR timed out."
     except Exception as exc:  # pragma: no cover - depends on optional runtime tools
         return None, str(exc)
 
 
-def run_barcode_scan(image: Image.Image) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def run_barcode_scan(image: Image.Image) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     if _scan_barcodes is None:
         return None, "Barcode service is not available."
     try:
-        return _scan_barcodes(image), None
+        with anyio.fail_after(max(0.1, float(BARCODE_TIMEOUT_MS) / 1000.0)):
+            result = await anyio.to_thread.run_sync(_scan_barcodes, image)
+        return result, None
+    except TimeoutError:
+        return None, "Barcode scan timed out."
     except Exception as exc:  # pragma: no cover - depends on optional runtime tools
         return None, str(exc)
 
@@ -568,9 +791,8 @@ def should_return_no_match(top_score: float, second_score: Optional[float], min_
 
 
 def match_explanation(item: Mapping[str, Any], query_ocr_text: Optional[str], query_barcodes: List[Dict[str, Any]], query_labels: List[str], score: float) -> Dict[str, Any]:
-    query_barcode_map = {value.lower(): value for value in barcode_values(query_barcodes)}
-    item_barcode_map = {value.lower(): value for value in barcode_values(normalize_barcodes(item.get("barcodes") or item.get("barcodeValues")))}
-    barcode_overlap = [item_barcode_map[key] for key in sorted(query_barcode_map.keys() & item_barcode_map.keys())][:3]
+    item_barcodes = normalize_barcodes(item.get("barcodes") or item.get("barcodeValues"))
+    barcode_overlap = barcode_overlap_values(query_barcodes, item_barcodes)
 
     query_ocr_tokens = set(tokenize(query_ocr_text))
     item_ocr_tokens = set(tokenize(item.get("ocrText")))
@@ -593,10 +815,23 @@ def match_explanation(item: Mapping[str, Any], query_ocr_text: Optional[str], qu
         reasons.append("shared labels")
     if not reasons:
         reasons.append("visual similarity")
+    similarity_band = "high" if score >= 0.85 else "medium" if score >= 0.65 else "low"
+    reason = ", ".join(reasons)
     return {
-        "reason": ", ".join(reasons),
+        "reason": reason,
+        "summary": reason,
         "signals": signals,
-        "scoreBand": "high" if score >= 0.85 else "medium" if score >= 0.65 else "low",
+        "scoreBand": similarity_band,
+        "similarity": {"cosine": round(float(score), 6), "band": similarity_band},
+        "ocr": {"matchedTerms": ocr_overlap, "matchCount": len(ocr_overlap)},
+        "barcode": {"matchedValues": barcode_overlap, "matchCount": len(barcode_overlap)},
+        "labels": {"matchedValues": label_overlap, "matchCount": len(label_overlap)},
+        "model": {
+            "engine": "clip",
+            "modelId": MODEL_NAME,
+            "serviceVersion": SERVICE_VERSION,
+            "scoringVersion": SCORING_VERSION,
+        },
     }
 
 
@@ -988,6 +1223,36 @@ def prepare_item_for_storage(existing: Optional[Dict[str, Any]], patch: Dict[str
     return current
 
 
+def parse_match_request(form: Mapping[str, Any]) -> MatchRequestModel:
+    thresholds_input = parse_optional_object(first_value(form, "thresholds"), "thresholds")
+    metadata_input = parse_optional_object(first_value(form, "metadata"), "metadata")
+    payload = {
+        "text": compact_text(first_value(form, "text", "queryText", "query"), limit=2000),
+        "topK": parse_top_k(first_value(form, "topK", "k", "limit")),
+        "status": compact_text(str(form.get("status") or "released"), limit=32) or "released",
+        "thresholds": {
+            "minScore": first_value(thresholds_input, "minScore") or first_value(form, "minScore") or CONF_MIN_SCORE,
+            "minMargin": first_value(thresholds_input, "minMargin") or first_value(form, "minMargin") or CONF_MIN_MARGIN,
+            "temperature": first_value(thresholds_input, "temperature") or first_value(form, "temperature") or CONF_TEMPERATURE,
+        },
+        "metadata": metadata_input,
+        "ocrText": compact_text(first_value(form, "ocrText", "ocr"), limit=500),
+        "barcodeValues": barcode_values(normalize_barcodes(first_value(form, "barcodeValues", "barcodes"))),
+        "labels": normalize_string_list(first_value(form, "labels", "tags")),
+        "doOcr": normalize_bool(form.get("doOcr"), default=True),
+        "doBarcode": normalize_bool(form.get("doBarcode"), default=True),
+        "ocrLang": compact_text(str(form.get("ocrLang") or "eng"), limit=32) or "eng",
+        "ocrPsm": int(form.get("ocrPsm") or 6),
+    }
+    try:
+        return MatchRequestModel.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=problem_detail("validation_error", "Request validation failed.", exc.errors()),
+        ) from exc
+
+
 UI_HTML = """
 <!doctype html>
 <html lang="en">
@@ -1156,12 +1421,12 @@ async def analyze_image(
     ocr_payload = None
     ocr_error = None
     if doOcr:
-        ocr_payload, ocr_error = run_ocr(pil_image, ocrLang, ocrPsm)
+        ocr_payload, ocr_error = await run_ocr(pil_image, ocrLang, ocrPsm)
 
     barcode_payload = None
     barcode_error = None
     if doBarcode:
-        barcode_payload, barcode_error = run_barcode_scan(pil_image)
+        barcode_payload, barcode_error = await run_barcode_scan(pil_image)
 
     scanned_barcodes = normalize_barcodes((barcode_payload or {}).get("barcodes"))
     combined_barcodes = merge_barcodes(manual_barcodes, scanned_barcodes)
@@ -1298,7 +1563,7 @@ def list_audit_logs(
     return with_request_id(request, {"logs": logs})
 
 
-@app.post("/match")
+@app.post("/match", response_model=MatchResponseModel)
 async def match(request: Request):
     started = time.time()
     endpoint = "/match"
@@ -1307,22 +1572,12 @@ async def match(request: Request):
 
     upload_value = first_value(form, "file", "image")
     upload = upload_value if is_upload(upload_value) else None
-    text = compact_text(first_value(form, "text", "queryText", "query"), limit=2000)
-    if upload is None and not text:
+    parsed_request = parse_match_request(form)
+    if upload is None and not parsed_request.text:
         raise HTTPException(
             status_code=400,
             detail=problem_detail("invalid_match_request", "Provide an image file, text query, or both."),
         )
-
-    do_ocr = normalize_bool(form.get("doOcr"), default=True)
-    do_barcode = normalize_bool(form.get("doBarcode"), default=True)
-    ocr_lang = compact_text(str(form.get("ocrLang") or "eng"), limit=32) or "eng"
-    ocr_psm = int(form.get("ocrPsm") or 6)
-    top_k = parse_top_k(first_value(form, "topK", "k", "limit"))
-    status_filter = compact_text(str(form.get("status") or "released"), limit=32) or "released"
-    manual_ocr_text = compact_text(first_value(form, "ocrText", "ocr"), limit=500)
-    manual_barcodes = normalize_barcodes(first_value(form, "barcodeValues", "barcodes"))
-    manual_labels = normalize_string_list(first_value(form, "labels", "tags"))
 
     query_embeddings: List[List[float]] = []
     query_image_info = None
@@ -1336,24 +1591,24 @@ async def match(request: Request):
         raw_bytes, pil_image = await read_image_upload(upload, "file")
         query_embeddings.append(image_embedding_for(pil_image))
         query_image_info = image_info(pil_image, upload)
-        if do_ocr:
-            query_ocr_payload, query_ocr_error = run_ocr(pil_image, ocr_lang, ocr_psm)
-        if do_barcode:
-            query_barcode_payload, query_barcode_error = run_barcode_scan(pil_image)
+        if parsed_request.doOcr:
+            query_ocr_payload, query_ocr_error = await run_ocr(pil_image, parsed_request.ocrLang, parsed_request.ocrPsm)
+        if parsed_request.doBarcode:
+            query_barcode_payload, query_barcode_error = await run_barcode_scan(pil_image)
 
-    if text:
-        query_embeddings.append(text_embedding_for(text))
+    if parsed_request.text:
+        query_embeddings.append(text_embedding_for(parsed_request.text))
 
     query_vector = normalize_vectors(np.mean(np.asarray(query_embeddings, dtype=float), axis=0))[0]
     scanned_barcodes = normalize_barcodes((query_barcode_payload or {}).get("barcodes"))
-    combined_barcodes = merge_barcodes(manual_barcodes, scanned_barcodes)
+    combined_barcodes = merge_barcodes(normalize_barcodes(parsed_request.barcodeValues), scanned_barcodes)
     query_barcode_values = barcode_values(combined_barcodes)
-    query_ocr_text = manual_ocr_text or ((query_ocr_payload or {}).get("fullText"))
+    query_ocr_text = parsed_request.ocrText or ((query_ocr_payload or {}).get("fullText"))
 
-    if status_filter == "released":
+    if parsed_request.status == "released":
         candidates = get_repository().list_released_items(limit=5000)
     else:
-        candidates = [item for item in get_repository().list_items(status=status_filter, limit=5000) if item.get("embedding")]
+        candidates = [item for item in get_repository().list_items(status=parsed_request.status, limit=5000) if item.get("embedding")]
 
     ranked: List[Dict[str, Any]] = []
     for candidate in candidates:
@@ -1364,12 +1619,17 @@ async def match(request: Request):
         ranked.append({"candidate": candidate, "score": score})
 
     ranked.sort(key=lambda row: row["score"], reverse=True)
-    top_rows = ranked[:top_k]
+    top_rows = ranked[: parsed_request.topK]
     scores = [row["score"] for row in top_rows]
-    confidences = softmax_confidences(scores, temperature=CONF_TEMPERATURE)
+    confidences = softmax_confidences(scores, temperature=parsed_request.thresholds.temperature)
     top_score = scores[0] if scores else 0.0
     second_score = scores[1] if len(scores) > 1 else None
-    no_match, no_match_meta = should_return_no_match(top_score, second_score, CONF_MIN_SCORE, CONF_MIN_MARGIN)
+    no_match, no_match_meta = should_return_no_match(
+        top_score,
+        second_score,
+        parsed_request.thresholds.minScore,
+        parsed_request.thresholds.minMargin,
+    )
 
     results: List[Dict[str, Any]] = []
     if not no_match:
@@ -1378,22 +1638,24 @@ async def match(request: Request):
             score = row["score"]
             results.append(
                 {
+                    "candidateId": candidate["id"],
                     "item": serialize_item(candidate, include_embedding=False),
                     "score": round(score, 6),
                     "confidence": round(float(confidence), 6),
-                    "explanation": match_explanation(candidate, query_ocr_text, combined_barcodes, manual_labels, score),
+                    "explanation": match_explanation(candidate, query_ocr_text, combined_barcodes, parsed_request.labels, score),
                 }
             )
 
     get_repository().add_audit_log(
         "AI_MATCH_GENERATION",
         {
-            "topK": top_k,
-            "statusFilter": status_filter,
-            "queryText": text,
+            "topK": parsed_request.topK,
+            "statusFilter": parsed_request.status,
+            "queryText": parsed_request.text,
             "resultIds": [result["item"]["id"] for result in results],
             "decisioning": {"noMatch": no_match, "meta": no_match_meta},
             "input": None if raw_bytes is None else {"sha256": sha256_hex(raw_bytes), "bytes": len(raw_bytes)},
+            "metadata": parsed_request.metadata,
         },
         request_id=get_request_id(request),
     )
@@ -1401,31 +1663,75 @@ async def match(request: Request):
     query_type_parts: List[str] = []
     if upload is not None:
         query_type_parts.append("image")
-    if text:
+    if parsed_request.text:
         query_type_parts.append("text")
 
-    response = with_request_id(
+    decision = {
+        "noMatch": no_match,
+        "reason": str(no_match_meta.get("reason") or ("OK" if not no_match else "NO_MATCH")),
+        "details": no_match_meta,
+    }
+    match_outcome = "no_match" if no_match else "matched"
+    record_match_outcome(match_outcome)
+    latency_ms = request_latency_ms(request)
+    logger.info(
+        "Match completed request_id=%s outcome=%s candidates=%s top_score=%.6f latency_ms=%s",
+        get_request_id(request),
+        match_outcome,
+        len(results),
+        top_score,
+        latency_ms,
+    )
+
+    response_data = with_request_id(
         request,
         {
-            "governance": governance_meta(
-                releasedOnly=status_filter == "released",
-                topKRequested=top_k,
-                candidatesEvaluated=len(ranked),
-                decisioning={"noMatch": no_match, "meta": no_match_meta},
-            ),
+            "governance": {
+                **governance_meta(),
+                "scoringVersion": SCORING_VERSION,
+                "thresholds": parsed_request.thresholds.model_dump(mode="json"),
+                "releasedOnly": parsed_request.status == "released",
+                "topKRequested": parsed_request.topK,
+                "candidatesEvaluated": len(ranked),
+                "latencyMs": latency_ms,
+                "decision": decision,
+            },
             "query": {
                 "type": "+".join(query_type_parts),
-                "text": text,
+                "modalities": query_type_parts,
+                "text": parsed_request.text,
                 "image": query_image_info,
-                "ocr": query_ocr_payload,
-                "ocrError": query_ocr_error,
-                "barcode": {"barcodes": combined_barcodes, "meta": (query_barcode_payload or {}).get("meta")} if combined_barcodes or query_barcode_payload else None,
-                "barcodeError": query_barcode_error,
-                "signals": compact_signals(query_ocr_text, query_barcode_values, manual_labels),
+                "metadata": parsed_request.metadata,
+                "thresholds": parsed_request.thresholds.model_dump(mode="json"),
+                "ocrText": query_ocr_text,
+                "ocr": {
+                    "fullText": (query_ocr_payload or {}).get("fullText"),
+                    "words": (query_ocr_payload or {}).get("words") or [],
+                    "meta": (query_ocr_payload or {}).get("meta"),
+                    "error": query_ocr_error,
+                },
+                "barcodeValues": query_barcode_values,
+                "barcode": {
+                    "barcodes": combined_barcodes,
+                    "meta": (query_barcode_payload or {}).get("meta"),
+                    "error": query_barcode_error,
+                },
+                "labels": parsed_request.labels,
+                "signals": compact_signals(query_ocr_text, query_barcode_values, parsed_request.labels),
             },
+            "decision": decision,
             "topK": results,
         },
     )
+    try:
+        response = MatchResponseModel.model_validate(response_data)
+    except ValidationError as exc:
+        logger.exception("Match response schema validation failed")
+        record_match_failure("response_schema_invalid")
+        raise HTTPException(
+            status_code=500,
+            detail=problem_detail("response_schema_invalid", "Match response schema validation failed.", exc.errors()),
+        ) from exc
     record_latency_metric(endpoint, started)
     record_request_metric(endpoint, 200)
     return response

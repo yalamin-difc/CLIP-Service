@@ -67,6 +67,18 @@ class ClipServiceTests(unittest.TestCase):
         clip_service.model = None
         clip_service.processor = None
 
+    def upsert_item_with_image(self, item_id, color, **fields):
+        payload = {"id": item_id, **fields}
+        return self.client.post(
+            "/items",
+            data=payload,
+            files={"file": (f"{item_id}.png", make_image_bytes(color), "image/png")},
+        )
+
+    def upsert_item_with_embedding(self, item_id, embedding, **fields):
+        payload = {"id": item_id, "clipEmbedding": embedding, **fields}
+        return self.client.post("/items", json=payload)
+
     def test_health_reports_dependencies_and_request_id(self):
         response = self.client.get("/health", headers={"X-Request-Id": "req-health"})
 
@@ -154,29 +166,23 @@ class ClipServiceTests(unittest.TestCase):
         self.assertEqual(release_payload["item"]["status"], "released")
 
     def test_match_returns_released_candidates_and_signal_explanations(self):
-        self.client.post(
-            "/items",
-            data={
-                "id": "item-red",
-                "title": "Red wallet",
-                "barcodeValues": "ABC123",
-                "ocrText": "Wallet ABC123",
-                "labels": "wallet,red",
-            },
-            files={"file": ("red.png", make_image_bytes((255, 0, 0)), "image/png")},
+        self.upsert_item_with_image(
+            "item-red",
+            (255, 0, 0),
+            title="Red wallet",
+            barcodeValues="ABC123",
+            ocrText="Wallet ABC123",
+            labels="wallet,red",
         )
         self.client.post("/items/item-red/release")
 
-        self.client.post(
-            "/items",
-            data={
-                "id": "item-blue",
-                "title": "Blue bag",
-                "barcodeValues": "XYZ999",
-                "ocrText": "Bag XYZ999",
-                "labels": "bag,blue",
-            },
-            files={"file": ("blue.png", make_image_bytes((0, 0, 255)), "image/png")},
+        self.upsert_item_with_image(
+            "item-blue",
+            (0, 0, 255),
+            title="Blue bag",
+            barcodeValues="XYZ999",
+            ocrText="Bag XYZ999",
+            labels="bag,blue",
         )
 
         response = self.client.post(
@@ -196,10 +202,125 @@ class ClipServiceTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["requestId"], "req-match")
         self.assertEqual(payload["governance"]["candidatesEvaluated"], 1)
+        self.assertEqual(payload["governance"]["scoringVersion"], "clip-match-v1")
+        self.assertFalse(payload["decision"]["noMatch"])
+        self.assertEqual(payload["decision"]["reason"], "OK")
         self.assertEqual(payload["topK"][0]["item"]["id"], "item-red")
+        self.assertEqual(payload["topK"][0]["candidateId"], "item-red")
         self.assertEqual(payload["topK"][0]["explanation"]["signals"]["barcode"], ["ABC123"])
-        self.assertIn("wallet", payload["topK"][0]["explanation"]["signals"]["ocr"])
+        self.assertIn("wallet", payload["topK"][0]["explanation"]["ocr"]["matchedTerms"])
         self.assertEqual(payload["query"]["signals"]["barcode"]["values"], ["ABC123"])
+        self.assertEqual(payload["query"]["modalities"], ["image"])
+        self.assertEqual(payload["query"]["thresholds"]["minScore"], clip_service.CONF_MIN_SCORE)
+
+    def test_match_text_only_uses_stable_contract(self):
+        self.upsert_item_with_embedding(
+            "item-red-text",
+            [255.0, 1.0, 1.0],
+            title="Red text wallet",
+            ocrText="Wallet receipt",
+            barcodes=[{"text": "TXT123"}],
+            labels=["wallet", "text"],
+        )
+        self.client.post("/items/item-red-text/release")
+
+        response = self.client.post(
+            "/match",
+            headers={"X-Request-Id": "req-text-match"},
+            data={"text": "red wallet", "topK": "2", "metadata": '{"source":"backend"}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["query"]["modalities"], ["text"])
+        self.assertEqual(payload["query"]["metadata"], {"source": "backend"})
+        self.assertEqual(payload["topK"][0]["candidateId"], "item-red-text")
+        self.assertEqual(payload["topK"][0]["explanation"]["model"]["scoringVersion"], "clip-match-v1")
+        self.assertIn("similarity", payload["topK"][0]["explanation"])
+
+    def test_match_image_and_text_combines_modalities(self):
+        self.upsert_item_with_image(
+            "item-combo",
+            (255, 0, 0),
+            title="Combo wallet",
+            ocrText="Wallet combo",
+            labels="wallet,combo",
+        )
+        self.client.post("/items/item-combo/release")
+
+        response = self.client.post(
+            "/match",
+            data={"text": "red wallet", "topK": "1"},
+            files={"file": ("combo.png", make_image_bytes((255, 0, 0)), "image/png")},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["query"]["modalities"], ["image", "text"])
+        self.assertEqual(payload["query"]["type"], "image+text")
+        self.assertEqual(payload["topK"][0]["item"]["id"], "item-combo")
+
+    def test_match_returns_explicit_no_match_decision(self):
+        self.upsert_item_with_embedding(
+            "item-blue-text",
+            [1.0, 1.0, 255.0],
+            title="Blue bag",
+            labels=["bag", "blue"],
+        )
+        self.client.post("/items/item-blue-text/release")
+
+        response = self.client.post("/match", data={"text": "red wallet", "topK": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["decision"]["noMatch"])
+        self.assertEqual(payload["topK"], [])
+        self.assertIn(payload["decision"]["reason"], {"LOW_TOP_SCORE", "LOW_MARGIN"})
+        self.assertTrue(payload["governance"]["decision"]["noMatch"])
+
+    def test_match_rejects_malformed_request(self):
+        response = self.client.post("/match", data={"topK": "oops", "text": "wallet"})
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertEqual(payload["success"], False)
+        self.assertEqual(payload["error"]["code"], "invalid_top_k")
+
+    def test_match_enforces_bearer_auth_when_configured(self):
+        with patch.object(clip_service, "CLIP_API_KEY", "secret-token"):
+            unauthorized = self.client.post("/match", data={"text": "wallet"})
+            self.assertEqual(unauthorized.status_code, 401)
+            self.assertEqual(unauthorized.json()["error"]["code"], "unauthorized")
+
+            authorized = self.client.post(
+                "/match",
+                headers={"Authorization": "Bearer secret-token"},
+                data={"text": "wallet"},
+            )
+            self.assertEqual(authorized.status_code, 200)
+
+    def test_match_schema_is_consistent(self):
+        self.upsert_item_with_embedding(
+            "item-schema",
+            [255.0, 1.0, 1.0],
+            title="Schema wallet",
+            labels=["wallet"],
+        )
+        self.client.post("/items/item-schema/release")
+
+        response = self.client.post("/match", data={"text": "red wallet", "topK": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(set(payload.keys()), {"requestId", "governance", "query", "decision", "topK"})
+        self.assertEqual(
+            set(payload["topK"][0].keys()),
+            {"candidateId", "item", "score", "confidence", "explanation"},
+        )
+        self.assertEqual(
+            set(payload["topK"][0]["explanation"].keys()),
+            {"reason", "summary", "scoreBand", "signals", "similarity", "ocr", "barcode", "labels", "model"},
+        )
 
     def test_errors_use_structured_contract(self):
         response = self.client.post("/encode-text", headers={"X-Request-Id": "req-error"}, data={})
