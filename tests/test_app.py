@@ -319,7 +319,7 @@ class ClipServiceTests(unittest.TestCase):
         with patch.object(clip_service, "ENVIRONMENT", "production"), patch.object(clip_service, "CLIP_API_KEY", ""):
             response = self.client.post("/match", data={"text": "wallet"})
             self.assertEqual(response.status_code, 503)
-            self.assertEqual(response.json()["error"]["code"], "auth_misconfigured")
+            self.assertEqual(response.json()["error"]["code"], "clip_auth_misconfigured")
 
     def test_match_schema_is_consistent(self):
         self.upsert_item_with_embedding(
