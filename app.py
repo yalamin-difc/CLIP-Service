@@ -51,6 +51,7 @@ ALLOW_ORIGIN_REGEX = r"^https:\/\/ai-lost-and-found-ver-2-.*\.vercel\.app$"
 REQUEST_ID_HEADER = "X-Request-Id"
 MODEL_NAME = os.environ.get("MODEL_ID", "openai/clip-vit-base-patch32").strip() or "openai/clip-vit-base-patch32"
 SERVICE_VERSION = os.environ.get("SERVICE_VERSION", "dev").strip() or "dev"
+ENVIRONMENT = os.environ.get("ENV", os.environ.get("NODE_ENV", "dev")).strip().lower() or "dev"
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 20
 CLIP_API_KEY = os.environ.get("CLIP_API_KEY", "").strip()
@@ -403,6 +404,11 @@ def governance_meta(**extra: Any) -> Dict[str, Any]:
 
 
 def require_auth(authorization: Optional[str]) -> None:
+    if not CLIP_API_KEY and ENVIRONMENT in {"prod", "production", "staging"}:
+        raise HTTPException(
+            status_code=503,
+            detail=problem_detail("clip_auth_misconfigured", "CLIP auth is not configured for this environment."),
+        )
     if not CLIP_API_KEY:
         return
     if authorization != f"Bearer {CLIP_API_KEY}":

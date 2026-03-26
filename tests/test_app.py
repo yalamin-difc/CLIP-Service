@@ -286,6 +286,22 @@ class ClipServiceTests(unittest.TestCase):
         self.assertEqual(payload["success"], False)
         self.assertEqual(payload["error"]["code"], "invalid_top_k")
 
+    def test_match_accepts_legacy_k_alias(self):
+        self.upsert_item_with_embedding(
+            "item-k-alias",
+            [255.0, 1.0, 1.0],
+            title="Alias wallet",
+            labels=["wallet"],
+        )
+        self.client.post("/items/item-k-alias/release")
+
+        response = self.client.post("/match", data={"text": "red wallet", "k": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["governance"]["topKRequested"], 1)
+        self.assertEqual(len(payload["topK"]), 1)
+
     def test_match_enforces_bearer_auth_when_configured(self):
         with patch.object(clip_service, "CLIP_API_KEY", "secret-token"):
             unauthorized = self.client.post("/match", data={"text": "wallet"})
@@ -298,6 +314,12 @@ class ClipServiceTests(unittest.TestCase):
                 data={"text": "wallet"},
             )
             self.assertEqual(authorized.status_code, 200)
+
+    def test_non_dev_environment_requires_auth_configuration(self):
+        with patch.object(clip_service, "ENVIRONMENT", "production"), patch.object(clip_service, "CLIP_API_KEY", ""):
+            response = self.client.post("/match", data={"text": "wallet"})
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()["error"]["code"], "auth_misconfigured")
 
     def test_match_schema_is_consistent(self):
         self.upsert_item_with_embedding(
@@ -321,6 +343,21 @@ class ClipServiceTests(unittest.TestCase):
             set(payload["topK"][0]["explanation"].keys()),
             {"reason", "summary", "scoreBand", "signals", "similarity", "ocr", "barcode", "labels", "model"},
         )
+
+    def test_items_upsert_accepts_clip_embedding_alias(self):
+        response = self.client.post(
+            "/items",
+            json={
+                "id": "item-clip-embedding",
+                "title": "Embedding alias",
+                "clipEmbedding": [255.0, 1.0, 1.0],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        release = self.client.post("/items/item-clip-embedding/release")
+        self.assertEqual(release.status_code, 200)
+        self.assertTrue(release.json()["item"]["eligibleForMatching"])
 
     def test_errors_use_structured_contract(self):
         response = self.client.post("/encode-text", headers={"X-Request-Id": "req-error"}, data={})
