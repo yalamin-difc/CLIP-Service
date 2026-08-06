@@ -9,8 +9,10 @@ import re
 import threading
 import time
 import uuid
+import warnings
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Dict, List, Mapping, Optional
 
 import anyio
@@ -22,15 +24,20 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from internal_auth import ServiceIdentity, require_identity
+
 try:  # pragma: no cover - optional runtime dependency
     from barcode_service import scan_barcodes as _scan_barcodes
 except Exception:  # pragma: no cover
     _scan_barcodes = None
 
 try:  # pragma: no cover - optional runtime dependency
-    from ocr_service import extract_ocr as _extract_ocr
+    from ocr_service import extract_ocr as _extract_ocr, ocr_dependency_ready
 except Exception:  # pragma: no cover
     _extract_ocr = None
+
+    def ocr_dependency_ready(required_languages: str = "eng+ara") -> bool:
+        return False
 
 try:  # pragma: no cover - optional runtime dependency
     from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -49,12 +56,14 @@ ALLOWED_ORIGINS = [
 ]
 ALLOW_ORIGIN_REGEX = r"^https:\/\/ai-lost-and-found-ver-2-.*\.vercel\.app$"
 REQUEST_ID_HEADER = "X-Request-Id"
-MODEL_NAME = os.environ.get("MODEL_ID", "openai/clip-vit-base-patch32").strip() or "openai/clip-vit-base-patch32"
+MODEL_NAME = "openai/clip-vit-base-patch32"
+MODEL_REVISION = "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268"
 SERVICE_VERSION = os.environ.get("SERVICE_VERSION", "dev").strip() or "dev"
 ENVIRONMENT = os.environ.get("ENV", os.environ.get("NODE_ENV", "dev")).strip().lower() or "dev"
+STORAGE_MODE = os.environ.get("STORAGE_MODE", "").strip().lower()
+INFERENCE_DEVICE = os.environ.get("INFERENCE_DEVICE", "cpu").strip().lower()
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 20
-CLIP_API_KEY = os.environ.get("CLIP_API_KEY", "").strip()
 MONGODB_URI = (os.environ.get("MONGODB_URI") or os.environ.get("MONGO_URI") or "").strip()
 MONGODB_DB = os.environ.get("MONGODB_DB", "clip_service").strip() or "clip_service"
 MONGODB_ITEMS_COLLECTION = os.environ.get("MONGODB_COLLECTION", "items").strip() or "items"
@@ -64,7 +73,24 @@ CONF_MIN_SCORE = float(os.environ.get("CONF_MIN_SCORE", "0.22"))
 CONF_MIN_MARGIN = float(os.environ.get("CONF_MIN_MARGIN", "0.03"))
 OCR_TIMEOUT_MS = int(os.environ.get("OCR_TIMEOUT_MS", "4000"))
 BARCODE_TIMEOUT_MS = int(os.environ.get("BARCODE_TIMEOUT_MS", "2500"))
+REQUEST_TIMEOUT_MS = int(os.environ.get("REQUEST_TIMEOUT_MS", "15000"))
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "25000000"))
+REQUEST_CONCURRENCY = int(os.environ.get("REQUEST_CONCURRENCY", "32"))
+OCR_CONCURRENCY = int(os.environ.get("OCR_CONCURRENCY", "2"))
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "120"))
+OCR_ENABLED = os.environ.get("OCR_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+OCR_LANGUAGES = os.environ.get("OCR_LANGUAGES", "eng+ara").strip() or "eng+ara"
+OCR_PSM = int(os.environ.get("OCR_PSM", "6"))
+APPROVED_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 SCORING_VERSION = "clip-match-v1"
+CORPUS_LIMIT = int(os.environ.get("CORPUS_LIMIT", "50000"))
+EXPECTED_EMBEDDING_DIMENSION = int(os.environ.get("EXPECTED_EMBEDDING_DIMENSION", "512"))
+
+request_limiter = anyio.CapacityLimiter(max(1, REQUEST_CONCURRENCY))
+ocr_limiter = anyio.CapacityLimiter(max(1, OCR_CONCURRENCY))
+rate_limit_lock = threading.Lock()
+rate_limit_windows: Dict[str, tuple[int, int]] = {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -320,7 +346,23 @@ async def request_id_middleware(request: Request, call_next):
     request_id = request.headers.get(REQUEST_ID_HEADER, "").strip() or str(uuid.uuid4())
     request.state.request_id = request_id
     request.state.request_started_at = time.time()
-    response = await call_next(request)
+    if request.url.path not in {"/health/live", "/health/ready"}:
+        client_key = request.client.host if request.client else "unknown"
+        window = int(time.time() // 60)
+        with rate_limit_lock:
+            stored_window, count = rate_limit_windows.get(client_key, (window, 0))
+            if stored_window != window:
+                stored_window, count = window, 0
+            count += 1
+            rate_limit_windows[client_key] = (stored_window, count)
+        if count > RATE_LIMIT_PER_MINUTE:
+            return error_response(request, 429, "rate_limit_exceeded", "Request rate limit exceeded.")
+    try:
+        async with request_limiter:
+            with anyio.fail_after(max(0.1, REQUEST_TIMEOUT_MS / 1000.0)):
+                response = await call_next(request)
+    except TimeoutError:
+        return error_response(request, 504, "request_timeout", "Request processing timed out.")
     response.headers[REQUEST_ID_HEADER] = request_id
     return response
 
@@ -403,16 +445,10 @@ def governance_meta(**extra: Any) -> Dict[str, Any]:
     return payload
 
 
-def require_auth(authorization: Optional[str]) -> None:
-    if not CLIP_API_KEY and ENVIRONMENT in {"prod", "production", "staging"}:
-        raise HTTPException(
-            status_code=503,
-            detail=problem_detail("clip_auth_misconfigured", "CLIP auth is not configured for this environment."),
-        )
-    if not CLIP_API_KEY:
-        return
-    if authorization != f"Bearer {CLIP_API_KEY}":
-        raise HTTPException(status_code=401, detail=problem_detail("unauthorized", "Unauthorized"))
+def authorize(request: Request, action: str) -> ServiceIdentity:
+    identity = require_identity(request, action)
+    request.state.identity = identity
+    return identity
 
 
 def compact_text(value: Optional[str], limit: int = 160) -> Optional[str]:
@@ -633,8 +669,14 @@ def normalize_vectors(value: Any) -> np.ndarray:
             status_code=400,
             detail=problem_detail("invalid_embedding", "Embedding must be a one- or two-dimensional numeric vector."),
         )
+    if not np.isfinite(array).all():
+        raise HTTPException(
+            status_code=400,
+            detail=problem_detail("invalid_embedding", "Embedding must contain only finite numeric values."),
+        )
     norms = np.linalg.norm(array, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
+    if np.any(norms <= 0):
+        raise HTTPException(status_code=400, detail=problem_detail("invalid_embedding", "Embedding norm must be greater than zero."))
     return array / norms
 
 
@@ -647,6 +689,25 @@ def normalize_embedding(value: Any) -> Optional[List[float]]:
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail=problem_detail("invalid_embedding", "Embedding must be valid JSON.")) from exc
     return [float(component) for component in normalize_vectors(value)[0].tolist()]
+
+
+def validate_stored_embedding(value: Any) -> List[float]:
+    normalized = normalize_embedding(value)
+    if normalized is None:
+        raise HTTPException(status_code=409, detail=problem_detail("missing_embedding", "An internal embedding is required."))
+    expected = embedding_dimension or EXPECTED_EMBEDDING_DIMENSION
+    if len(normalized) != expected:
+        raise HTTPException(
+            status_code=409,
+            detail=problem_detail(
+                "embedding_dimension_mismatch",
+                f"Embedding dimension {len(normalized)} is incompatible with expected dimension {expected}.",
+            ),
+        )
+    norm = float(np.linalg.norm(np.asarray(normalized, dtype=float)))
+    if not np.isclose(norm, 1.0, rtol=1e-5, atol=1e-6):
+        raise HTTPException(status_code=409, detail=problem_detail("embedding_not_normalized", "Embedding is not normalized."))
+    return normalized
 
 
 @contextmanager
@@ -663,10 +724,31 @@ def inference_mode():
 model = None
 processor = None
 model_lock = threading.Lock()
+embedding_dimension: Optional[int] = None
+model_warmup_completed = False
+model_load_error: Optional[str] = None
+
+
+def configured_device() -> str:
+    if INFERENCE_DEVICE not in {"cpu", "cuda"}:
+        raise RuntimeError("INFERENCE_DEVICE must be explicitly set to 'cpu' or 'cuda'")
+    if INFERENCE_DEVICE == "cuda":
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError("CUDA was configured but PyTorch is unavailable") from exc
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was configured but no CUDA device is available")
+    return INFERENCE_DEVICE
+
+
+def _move_inputs_to_device(inputs: Mapping[str, Any]) -> Dict[str, Any]:
+    device = configured_device()
+    return {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
 
 
 def load_model():
-    global model, processor
+    global model, processor, model_load_error
     if model is None or processor is None:
         with model_lock:
             if model is None or processor is None:
@@ -677,13 +759,50 @@ def load_model():
                         status_code=503,
                         detail=problem_detail("model_unavailable", "CLIP model dependencies are not installed."),
                     ) from exc
-                model = CLIPModel.from_pretrained(MODEL_NAME)
-                processor = CLIPProcessor.from_pretrained(MODEL_NAME)
+                try:
+                    device = configured_device()
+                    model = CLIPModel.from_pretrained(MODEL_NAME, revision=MODEL_REVISION)
+                    processor = CLIPProcessor.from_pretrained(MODEL_NAME, revision=MODEL_REVISION)
+                    if hasattr(model, "to"):
+                        model = model.to(device)
+                    if hasattr(model, "eval"):
+                        model.eval()
+                    model_load_error = None
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "model_load",
+                                "modelId": MODEL_NAME,
+                                "modelRevision": MODEL_REVISION,
+                                "device": device,
+                            }
+                        )
+                    )
+                except Exception as exc:
+                    model_load_error = type(exc).__name__
+                    logger.error(
+                        json.dumps(
+                            {
+                                "event": "model_failure",
+                                "modelId": MODEL_NAME,
+                                "modelRevision": MODEL_REVISION,
+                                "errorType": type(exc).__name__,
+                            }
+                        )
+                    )
+                    raise
     return model, processor
 
 
 def model_health() -> Dict[str, Any]:
-    return {"name": MODEL_NAME, "loaded": model is not None and processor is not None}
+    return {
+        "modelId": MODEL_NAME,
+        "modelRevision": MODEL_REVISION,
+        "loaded": model is not None and processor is not None,
+        "embeddingDimension": embedding_dimension,
+        "device": INFERENCE_DEVICE,
+        "warmupCompleted": model_warmup_completed,
+    }
 
 
 async def read_image_upload(upload: Optional[UploadFile], field_name: str) -> tuple[bytes, Image.Image]:
@@ -692,15 +811,40 @@ async def read_image_upload(upload: Optional[UploadFile], field_name: str) -> tu
             status_code=400,
             detail=problem_detail("missing_image", f"Missing image upload in field '{field_name}'."),
         )
+    content_type = (upload.content_type or "").lower()
+    if content_type not in APPROVED_IMAGE_MIME_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=problem_detail("unsupported_image_type", "Image MIME type is not approved."),
+        )
     try:
-        payload = await upload.read()
+        payload = await upload.read(MAX_UPLOAD_BYTES + 1)
     finally:
         await upload.close()
     if not payload:
         raise HTTPException(status_code=400, detail=problem_detail("invalid_image", "Uploaded image is empty."))
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=problem_detail("image_too_large", "Uploaded image exceeds the size limit."))
     try:
-        image = Image.open(io.BytesIO(payload)).convert("RGB")
-    except (UnidentifiedImageError, OSError) as exc:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            image = Image.open(io.BytesIO(payload))
+            image.verify()
+            image = Image.open(io.BytesIO(payload))
+            if image.width * image.height > MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=problem_detail("image_too_many_pixels", "Decoded image exceeds the pixel limit."),
+                )
+            image = image.convert("RGB")
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise HTTPException(
+            status_code=413,
+            detail=problem_detail("image_too_many_pixels", "Decoded image exceeds the pixel limit."),
+        )
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=problem_detail("invalid_image", "Uploaded file is not a valid image.")) from exc
     return payload, image
 
@@ -715,42 +859,60 @@ def image_info(image: Image.Image, upload: Optional[UploadFile] = None) -> Dict[
 
 
 def image_embedding_for(image: Image.Image) -> List[float]:
+    global embedding_dimension
     model_instance, processor_instance = load_model()
     try:
-        inputs = processor_instance(images=image, return_tensors="pt")
+        inputs = _move_inputs_to_device(processor_instance(images=image, return_tensors="pt"))
         with inference_mode():
             features = model_instance.get_image_features(**inputs)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=problem_detail("model_inference_failed", "Failed to encode image.")) from exc
-    return [float(value) for value in normalize_vectors(features)[0].tolist()]
+    embedding = [float(value) for value in normalize_vectors(features)[0].tolist()]
+    embedding_dimension = len(embedding)
+    return embedding
 
 
 def text_embedding_for(text: str) -> List[float]:
+    global embedding_dimension
     model_instance, processor_instance = load_model()
     try:
-        inputs = processor_instance(text=[text], return_tensors="pt", padding=True)
+        inputs = _move_inputs_to_device(processor_instance(text=[text], return_tensors="pt", padding=True))
         with inference_mode():
             features = model_instance.get_text_features(**inputs)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=problem_detail("model_inference_failed", "Failed to encode text.")) from exc
-    return [float(value) for value in normalize_vectors(features)[0].tolist()]
+    embedding = [float(value) for value in normalize_vectors(features)[0].tolist()]
+    embedding_dimension = len(embedding)
+    return embedding
+
+
+def warmup_model() -> None:
+    global model_warmup_completed
+    model_warmup_completed = False
+    image_embedding_for(Image.new("RGB", (32, 32), "white"))
+    model_warmup_completed = True
 
 
 async def run_ocr(image: Image.Image, lang: str, psm: int) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not OCR_ENABLED:
+        return None, "OCR is disabled by service configuration."
     if _extract_ocr is None:
         return None, "OCR service is not available."
     try:
         with anyio.fail_after(max(0.1, float(OCR_TIMEOUT_MS) / 1000.0)):
-            result = await anyio.to_thread.run_sync(_extract_ocr, image, lang=lang, psm=int(psm))
+            invocation = partial(_extract_ocr, image, lang=lang, psm=int(psm))
+            result = await anyio.to_thread.run_sync(invocation, limiter=ocr_limiter, abandon_on_cancel=True)
         return result, None
     except TimeoutError:
+        logger.warning(json.dumps({"event": "ocr_failure", "reason": "timeout"}))
         return None, "OCR timed out."
     except Exception as exc:  # pragma: no cover - depends on optional runtime tools
-        return None, str(exc)
+        logger.warning(json.dumps({"event": "ocr_failure", "reason": type(exc).__name__}))
+        return None, "OCR failed."
 
 
 async def run_barcode_scan(image: Image.Image) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -845,22 +1007,34 @@ class ItemRepository:
     def health(self) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+    def get_item(self, item_id: str, identity: ServiceIdentity) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
 
     def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def list_items(self, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+    def delete_item(self, item_id: str, identity: ServiceIdentity) -> bool:
         raise NotImplementedError
 
-    def list_released_items(self, limit: int = 5000) -> List[Dict[str, Any]]:
+    def list_items(self, identity: ServiceIdentity, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
-    def add_audit_log(self, event_type: str, payload: Dict[str, Any], item_id: Optional[str] = None, request_id: Optional[str] = None) -> str:
+    def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
-    def list_audit_logs(self, item_id: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+    def add_audit_log(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        item_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> str:
+        raise NotImplementedError
+
+    def list_audit_logs(
+        self, identity: ServiceIdentity, item_id: Optional[str] = None, limit: int = 200, offset: int = 0
+    ) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
 
@@ -870,39 +1044,72 @@ class InMemoryItemRepository(ItemRepository):
         self._logs: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _key(tenant_id: str, site_id: str, item_id: str) -> str:
+        return f"{tenant_id}\x1f{site_id}\x1f{item_id}"
+
     def health(self) -> Dict[str, Any]:
         return {"backend": "memory", "configured": False, "ok": True, "items": len(self._items)}
 
-    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+    def get_item(self, item_id: str, identity: ServiceIdentity) -> Optional[Dict[str, Any]]:
         with self._lock:
-            item = self._items.get(item_id)
-            return dict(item) if item else None
+            for site_id in identity.permitted_site_ids:
+                item = self._items.get(self._key(identity.tenant_id, site_id, item_id))
+                if item:
+                    return dict(item)
+            return None
 
     def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
             stored = dict(item)
-            self._items[item["id"]] = stored
+            self._items[self._key(item["tenantId"], item["siteId"], item["id"])] = stored
             return dict(stored)
 
-    def list_items(self, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+    def delete_item(self, item_id: str, identity: ServiceIdentity) -> bool:
         with self._lock:
-            items = [dict(value) for value in self._items.values()]
+            for site_id in identity.permitted_site_ids:
+                key = self._key(identity.tenant_id, site_id, item_id)
+                if key in self._items:
+                    del self._items[key]
+                    return True
+            return False
+
+    def list_items(self, identity: ServiceIdentity, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = [
+                dict(value)
+                for value in self._items.values()
+                if value.get("tenantId") == identity.tenant_id and value.get("siteId") in identity.permitted_site_ids
+            ]
         if status:
             items = [item for item in items if item.get("status") == status]
         items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
         return items[:limit]
 
-    def list_released_items(self, limit: int = 5000) -> List[Dict[str, Any]]:
+    def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
         with self._lock:
             items = [
                 dict(value)
                 for value in self._items.values()
-                if value.get("released") and value.get("eligibleForMatching")
+                if value.get("tenantId") == identity.tenant_id
+                and value.get("siteId") in identity.permitted_site_ids
+                and value.get("released")
+                and value.get("eligibleForMatching")
+                and value.get("modelId") == MODEL_NAME
+                and value.get("modelRevision") == MODEL_REVISION
+                and value.get("embeddingDimension") == (embedding_dimension or EXPECTED_EMBEDDING_DIMENSION)
             ]
         items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
         return items[:limit]
 
-    def add_audit_log(self, event_type: str, payload: Dict[str, Any], item_id: Optional[str] = None, request_id: Optional[str] = None) -> str:
+    def add_audit_log(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        item_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> str:
         with self._lock:
             log_id = str(uuid.uuid4())
             self._logs.append(
@@ -912,14 +1119,17 @@ class InMemoryItemRepository(ItemRepository):
                     "eventType": event_type,
                     "itemId": item_id,
                     "requestId": request_id,
+                    "tenantId": tenant_id,
                     "payload": payload or {},
                 }
             )
             return log_id
 
-    def list_audit_logs(self, item_id: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+    def list_audit_logs(
+        self, identity: ServiceIdentity, item_id: Optional[str] = None, limit: int = 200, offset: int = 0
+    ) -> List[Dict[str, Any]]:
         with self._lock:
-            logs = list(reversed(self._logs))
+            logs = [log for log in reversed(self._logs) if log.get("tenantId") == identity.tenant_id]
         if item_id:
             logs = [log for log in logs if log.get("itemId") == item_id]
         return logs[offset : offset + limit]
@@ -935,22 +1145,34 @@ class UnavailableItemRepository(ItemRepository):
     def _raise(self) -> None:
         raise HTTPException(status_code=503, detail=problem_detail("store_unavailable", self.reason))
 
-    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
+    def get_item(self, item_id: str, identity: ServiceIdentity) -> Optional[Dict[str, Any]]:
         self._raise()
 
     def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         self._raise()
 
-    def list_items(self, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+    def delete_item(self, item_id: str, identity: ServiceIdentity) -> bool:
         self._raise()
 
-    def list_released_items(self, limit: int = 5000) -> List[Dict[str, Any]]:
+    def list_items(self, identity: ServiceIdentity, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
         self._raise()
 
-    def add_audit_log(self, event_type: str, payload: Dict[str, Any], item_id: Optional[str] = None, request_id: Optional[str] = None) -> str:
+    def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
         self._raise()
 
-    def list_audit_logs(self, item_id: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+    def add_audit_log(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        item_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> str:
+        self._raise()
+
+    def list_audit_logs(
+        self, identity: ServiceIdentity, item_id: Optional[str] = None, limit: int = 200, offset: int = 0
+    ) -> List[Dict[str, Any]]:
         self._raise()
 
 
@@ -961,7 +1183,8 @@ class MongoItemRepository(ItemRepository):
         self._client = MongoClient(uri, serverSelectionTimeoutMS=1000)
         self._items = self._client[database][items_collection]
         self._audit = self._client[database][audit_collection]
-        self._items.create_index("id", unique=True)
+        self._items.create_index([("tenantId", 1), ("siteId", 1), ("id", 1)], unique=True)
+        self._items.create_index([("tenantId", 1), ("siteId", 1), ("status", 1), ("modelId", 1), ("modelRevision", 1)])
         self._items.create_index([("status", 1), ("updatedAt", -1)])
         self._audit.create_index([("ts", -1)])
         self._audit.create_index([("itemId", 1), ("ts", -1)])
@@ -980,39 +1203,77 @@ class MongoItemRepository(ItemRepository):
         cleaned.pop("_id", None)
         return cleaned
 
-    def get_item(self, item_id: str) -> Optional[Dict[str, Any]]:
-        return self._clean_item(self._items.find_one({"id": item_id}))
+    def get_item(self, item_id: str, identity: ServiceIdentity) -> Optional[Dict[str, Any]]:
+        return self._clean_item(
+            self._items.find_one(
+                {"id": item_id, "tenantId": identity.tenant_id, "siteId": {"$in": list(identity.permitted_site_ids)}}
+            )
+        )
 
     def upsert_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        self._items.update_one({"id": item["id"]}, {"$set": item}, upsert=True)
-        stored = self.get_item(item["id"])
+        selector = {"id": item["id"], "tenantId": item["tenantId"], "siteId": item["siteId"]}
+        self._items.update_one(selector, {"$set": item}, upsert=True)
+        stored = self._clean_item(self._items.find_one(selector))
         if stored is None:
             raise HTTPException(status_code=503, detail=problem_detail("store_unavailable", "Failed to read item after upsert."))
         return stored
 
-    def list_items(self, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
-        query: Dict[str, Any] = {}
+    def delete_item(self, item_id: str, identity: ServiceIdentity) -> bool:
+        result = self._items.delete_one(
+            {"id": item_id, "tenantId": identity.tenant_id, "siteId": {"$in": list(identity.permitted_site_ids)}}
+        )
+        return result.deleted_count == 1
+
+    def list_items(self, identity: ServiceIdentity, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {
+            "tenantId": identity.tenant_id,
+            "siteId": {"$in": list(identity.permitted_site_ids)},
+        }
         if status:
             query["status"] = status
         cursor = self._items.find(query).sort("updatedAt", -1).limit(limit)
         return [self._clean_item(item) for item in cursor if item is not None]
 
-    def list_released_items(self, limit: int = 5000) -> List[Dict[str, Any]]:
-        cursor = self._items.find({"released": True, "eligibleForMatching": True}).sort("updatedAt", -1).limit(limit)
+    def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
+        cursor = (
+            self._items.find(
+                {
+                    "tenantId": identity.tenant_id,
+                    "siteId": {"$in": list(identity.permitted_site_ids)},
+                    "released": True,
+                    "eligibleForMatching": True,
+                    "modelId": MODEL_NAME,
+                    "modelRevision": MODEL_REVISION,
+                    "embeddingDimension": embedding_dimension or EXPECTED_EMBEDDING_DIMENSION,
+                }
+            )
+            .sort("updatedAt", -1)
+            .limit(limit)
+        )
         return [self._clean_item(item) for item in cursor if item is not None]
 
-    def add_audit_log(self, event_type: str, payload: Dict[str, Any], item_id: Optional[str] = None, request_id: Optional[str] = None) -> str:
+    def add_audit_log(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        item_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> str:
         document = {
             "ts": now_iso(),
             "eventType": event_type,
             "itemId": item_id,
             "requestId": request_id,
+            "tenantId": tenant_id,
             "payload": payload or {},
         }
         return str(self._audit.insert_one(document).inserted_id)
 
-    def list_audit_logs(self, item_id: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
-        query: Dict[str, Any] = {}
+    def list_audit_logs(
+        self, identity: ServiceIdentity, item_id: Optional[str] = None, limit: int = 200, offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        query: Dict[str, Any] = {"tenantId": identity.tenant_id}
         if item_id:
             query["itemId"] = item_id
         cursor = self._audit.find(query).sort("ts", -1).skip(offset).limit(limit)
@@ -1029,12 +1290,20 @@ repository: Optional[ItemRepository] = None
 
 
 def build_repository() -> ItemRepository:
-    if not MONGODB_URI:
+    strict_environment = ENVIRONMENT in {"festival", "staging", "prod", "production"}
+    if STORAGE_MODE == "memory":
+        if strict_environment:
+            raise RuntimeError("In-memory storage is forbidden in festival, staging, and production environments")
         return InMemoryItemRepository()
-    try:
-        return MongoItemRepository(MONGODB_URI, MONGODB_DB, MONGODB_ITEMS_COLLECTION, MONGODB_AUDIT_COLLECTION)
-    except Exception as exc:  # pragma: no cover - depends on live mongo
-        return UnavailableItemRepository(f"Mongo repository unavailable: {exc}")
+    if STORAGE_MODE != "mongodb":
+        raise RuntimeError("STORAGE_MODE must be explicitly configured as 'memory' or 'mongodb'")
+    if not MONGODB_URI:
+        raise RuntimeError("MONGODB_URI is required when STORAGE_MODE=mongodb")
+    mongo_repository = MongoItemRepository(MONGODB_URI, MONGODB_DB, MONGODB_ITEMS_COLLECTION, MONGODB_AUDIT_COLLECTION)
+    health = mongo_repository.health()
+    if not health.get("ok"):
+        raise RuntimeError("MongoDB is unavailable")
+    return mongo_repository
 
 
 def get_repository() -> ItemRepository:
@@ -1071,9 +1340,15 @@ def serialize_item(item: Mapping[str, Any], include_embedding: bool = False) -> 
         "createdAt": item.get("createdAt"),
         "updatedAt": item.get("updatedAt"),
         "releasedAt": item.get("releasedAt"),
+        "tenantId": item.get("tenantId"),
+        "siteId": item.get("siteId"),
+        "datasetVersion": item.get("datasetVersion"),
+        "demoData": bool(item.get("demoData")),
+        "createdBy": item.get("createdBy"),
+        "modelId": item.get("modelId"),
+        "modelRevision": item.get("modelRevision"),
+        "embeddingDimension": item.get("embeddingDimension"),
     }
-    if include_embedding and item.get("embedding") is not None:
-        payload["clipEmbedding"] = item.get("embedding")
     return payload
 
 
@@ -1082,6 +1357,32 @@ def parse_item_payload(raw_payload: Mapping[str, Any]) -> Dict[str, Any]:
     nested = payload.get("item")
     if isinstance(nested, Mapping):
         payload = {**nested, **{key: value for key, value in payload.items() if key != "item"}}
+    forbidden = {
+        "tenantId",
+        "siteId",
+        "datasetVersion",
+        "demoData",
+        "createdBy",
+        "createdAt",
+        "status",
+        "released",
+        "eligibleForMatching",
+        "embedding",
+        "clipEmbedding",
+        "modelId",
+        "modelRevision",
+        "embeddingDimension",
+    }
+    supplied_forbidden = sorted(forbidden.intersection(payload))
+    if supplied_forbidden:
+        raise HTTPException(
+            status_code=400,
+            detail=problem_detail(
+                "system_fields_forbidden",
+                "Corpus system fields are controlled by the trusted service.",
+                {"fields": supplied_forbidden},
+            ),
+        )
 
     item_id = compact_text(str(first_value(payload, "id", "itemId") or str(uuid.uuid4())), limit=120)
     if not item_id:
@@ -1098,15 +1399,6 @@ def parse_item_payload(raw_payload: Mapping[str, Any]) -> Dict[str, Any]:
         item["metadata"] = normalize_mapping(payload.get("metadata"), "metadata")
     if "labels" in payload or "tags" in payload:
         item["labels"] = normalize_string_list(first_value(payload, "labels", "tags"))
-    if "status" in payload:
-        item["status"] = compact_text(str(payload.get("status")), limit=32)
-    if "released" in payload:
-        item["released"] = normalize_bool(payload.get("released"), default=False)
-    if "embedding" in payload or "clipEmbedding" in payload:
-        embedding = normalize_embedding(first_value(payload, "embedding", "clipEmbedding"))
-        item["embedding"] = embedding
-        item["clipEmbedding"] = embedding
-
     ocr_payload = payload.get("ocr")
     ocr_text = None
     ocr_words = None
@@ -1192,10 +1484,19 @@ async def parse_items_request(request: Request) -> Dict[str, Any]:
     return parsed
 
 
-def prepare_item_for_storage(existing: Optional[Dict[str, Any]], patch: Dict[str, Any]) -> Dict[str, Any]:
+def prepare_item_for_storage(
+    existing: Optional[Dict[str, Any]], patch: Dict[str, Any], identity: ServiceIdentity
+) -> Dict[str, Any]:
     current = dict(existing or {})
     current.update(patch)
     current["id"] = patch["id"]
+    current["tenantId"] = identity.tenant_id
+    current["siteId"] = identity.site_id
+    current["datasetVersion"] = identity.dataset_version
+    current["demoData"] = identity.demo_data
+    current["createdBy"] = current.get("createdBy") or identity.service_name
+    current["modelId"] = MODEL_NAME
+    current["modelRevision"] = MODEL_REVISION
     title = current.get("title") or current.get("name")
     current["title"] = title
     current["name"] = title
@@ -1214,7 +1515,11 @@ def prepare_item_for_storage(existing: Optional[Dict[str, Any]], patch: Dict[str
     else:
         current.setdefault("ocr", None)
     if current.get("embedding") is not None:
+        current["embedding"] = validate_stored_embedding(current["embedding"])
         current["clipEmbedding"] = current["embedding"]
+        current["embeddingDimension"] = len(current["embedding"])
+    else:
+        current["embeddingDimension"] = embedding_dimension or EXPECTED_EMBEDDING_DIMENSION
     current.setdefault("released", False)
     has_embedding = bool(current.get("embedding"))
     current["eligibleForMatching"] = bool(current.get("released")) and has_embedding
@@ -1230,25 +1535,48 @@ def prepare_item_for_storage(existing: Optional[Dict[str, Any]], patch: Dict[str
 
 
 def parse_match_request(form: Mapping[str, Any]) -> MatchRequestModel:
-    thresholds_input = parse_optional_object(first_value(form, "thresholds"), "thresholds")
+    forbidden_controls = {
+        "status",
+        "thresholds",
+        "minScore",
+        "minMargin",
+        "temperature",
+        "doOcr",
+        "doBarcode",
+        "ocrLang",
+        "ocrPsm",
+        "modelId",
+        "modelRevision",
+        "embeddingDimension",
+    }
+    supplied = sorted(forbidden_controls.intersection(form))
+    if supplied:
+        raise HTTPException(
+            status_code=400,
+            detail=problem_detail(
+                "system_controls_forbidden",
+                "Matching policy and model controls are configured by the service.",
+                {"fields": supplied},
+            ),
+        )
     metadata_input = parse_optional_object(first_value(form, "metadata"), "metadata")
     payload = {
         "text": compact_text(first_value(form, "text", "queryText", "query"), limit=2000),
         "topK": parse_top_k(first_value(form, "topK", "k", "limit")),
-        "status": compact_text(str(form.get("status") or "released"), limit=32) or "released",
+        "status": "released",
         "thresholds": {
-            "minScore": first_value(thresholds_input, "minScore") or first_value(form, "minScore") or CONF_MIN_SCORE,
-            "minMargin": first_value(thresholds_input, "minMargin") or first_value(form, "minMargin") or CONF_MIN_MARGIN,
-            "temperature": first_value(thresholds_input, "temperature") or first_value(form, "temperature") or CONF_TEMPERATURE,
+            "minScore": CONF_MIN_SCORE,
+            "minMargin": CONF_MIN_MARGIN,
+            "temperature": CONF_TEMPERATURE,
         },
         "metadata": metadata_input,
         "ocrText": compact_text(first_value(form, "ocrText", "ocr"), limit=500),
         "barcodeValues": barcode_values(normalize_barcodes(first_value(form, "barcodeValues", "barcodes"))),
         "labels": normalize_string_list(first_value(form, "labels", "tags")),
-        "doOcr": normalize_bool(form.get("doOcr"), default=True),
-        "doBarcode": normalize_bool(form.get("doBarcode"), default=True),
-        "ocrLang": compact_text(str(form.get("ocrLang") or "eng"), limit=32) or "eng",
-        "ocrPsm": int(form.get("ocrPsm") or 6),
+        "doOcr": OCR_ENABLED,
+        "doBarcode": True,
+        "ocrLang": OCR_LANGUAGES,
+        "ocrPsm": OCR_PSM,
     }
     try:
         return MatchRequestModel.model_validate(payload)
@@ -1290,7 +1618,8 @@ UI_HTML = """
 
 
 @app.get("/metrics")
-def metrics():
+def metrics(request: Request):
+    authorize(request, "metrics:read")
     if generate_latest is None:
         raise HTTPException(status_code=503, detail=problem_detail("metrics_unavailable", "Metrics not available."))
     if METRIC_MODEL_LOADED is not None:
@@ -1300,11 +1629,12 @@ def metrics():
 
 @app.get("/")
 def home(request: Request):
-    return with_request_id(request, {"status": "running", "modelLoaded": model is not None and processor is not None})
+    return with_request_id(request, {"status": "ok"})
 
 
 @app.get("/health")
 def health(request: Request):
+    authorize(request, "health:read")
     store_health = get_repository().health()
     overall_status = "ok" if store_health.get("ok", False) else "degraded"
     return with_request_id(
@@ -1319,6 +1649,46 @@ def health(request: Request):
     )
 
 
+@app.get("/health/live")
+def health_live(request: Request):
+    return with_request_id(request, {"status": "ok"})
+
+
+@app.get("/health/ready")
+def health_ready(request: Request):
+    database_ready = False
+    try:
+        database_ready = bool(get_repository().health().get("ok"))
+    except Exception:
+        database_ready = False
+    checks = {
+        "modelLoaded": model is not None and processor is not None,
+        "embeddingDimensionKnown": isinstance(embedding_dimension, int) and embedding_dimension > 0,
+        "ocrDependencyReady": (not OCR_ENABLED) or ocr_dependency_ready(OCR_LANGUAGES),
+        "databaseReady": database_ready,
+        "device": INFERENCE_DEVICE,
+        "warmupCompleted": model_warmup_completed,
+    }
+    ready = all(value for key, value in checks.items() if key != "device")
+    payload = with_request_id(request, {"status": "ready" if ready else "not_ready", "checks": checks})
+    return JSONResponse(status_code=200 if ready else 503, content=payload)
+
+
+def initialize_runtime() -> None:
+    configured_device()
+    store = get_repository()
+    if not store.health().get("ok"):
+        raise RuntimeError("Configured database is unavailable")
+    if OCR_ENABLED and not ocr_dependency_ready(OCR_LANGUAGES):
+        raise RuntimeError("Configured OCR dependency or language data is unavailable")
+    warmup_model()
+
+
+@app.on_event("startup")
+def startup_runtime() -> None:
+    initialize_runtime()
+
+
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
     return HTMLResponse(UI_HTML)
@@ -1329,16 +1699,24 @@ async def encode_image(
     request: Request,
     file: Optional[UploadFile] = File(default=None),
     image: Optional[UploadFile] = File(default=None),
-    authorization: Optional[str] = Header(default=None),
 ):
     started = time.time()
     endpoint = "/encode-image"
-    require_auth(authorization)
+    authorize(request, "match:execute")
     upload = file or image
     if upload is None:
         raise HTTPException(status_code=400, detail=problem_detail("missing_image", "No image uploaded. Use form field 'file' or 'image'."))
     _, pil_image = await read_image_upload(upload, "file")
-    response = with_request_id(request, {"embedding": image_embedding_for(pil_image)})
+    encoded = image_embedding_for(pil_image)
+    response = with_request_id(
+        request,
+        {
+            "encoded": True,
+            "modelId": MODEL_NAME,
+            "modelRevision": MODEL_REVISION,
+            "embeddingDimension": len(encoded),
+        },
+    )
     record_latency_metric(endpoint, started)
     record_request_metric(endpoint, 200)
     return response
@@ -1349,15 +1727,23 @@ async def encode_text(
     request: Request,
     text: Optional[str] = Form(default=None),
     queryText: Optional[str] = Form(default=None),
-    authorization: Optional[str] = Header(default=None),
 ):
     started = time.time()
     endpoint = "/encode-text"
-    require_auth(authorization)
+    authorize(request, "match:execute")
     value = compact_text(text or queryText, limit=2000)
     if not value:
         raise HTTPException(status_code=400, detail=problem_detail("missing_text", "No text provided. Use form field 'text' or 'queryText'."))
-    response = with_request_id(request, {"embedding": text_embedding_for(value)})
+    encoded = text_embedding_for(value)
+    response = with_request_id(
+        request,
+        {
+            "encoded": True,
+            "modelId": MODEL_NAME,
+            "modelRevision": MODEL_REVISION,
+            "embeddingDimension": len(encoded),
+        },
+    )
     record_latency_metric(endpoint, started)
     record_request_metric(endpoint, 200)
     return response
@@ -1370,11 +1756,10 @@ async def similarity(
     file2: Optional[UploadFile] = File(default=None),
     image1: Optional[UploadFile] = File(default=None),
     image2: Optional[UploadFile] = File(default=None),
-    authorization: Optional[str] = Header(default=None),
 ):
     started = time.time()
     endpoint = "/similarity"
-    require_auth(authorization)
+    authorize(request, "match:execute")
     upload_1 = file1 or image1
     upload_2 = file2 or image2
     if upload_1 is None or upload_2 is None:
@@ -1397,15 +1782,12 @@ async def analyze_image(
     request: Request,
     file: Optional[UploadFile] = File(default=None),
     image: Optional[UploadFile] = File(default=None),
-    doOcr: bool = Form(default=True),
-    doBarcode: bool = Form(default=True),
-    ocrLang: str = Form(default="eng"),
-    ocrPsm: int = Form(default=6),
-    authorization: Optional[str] = Header(default=None),
 ):
     started = time.time()
     endpoint = "/analyze-image"
-    require_auth(authorization)
+    identity = authorize(request, "match:execute")
+    do_ocr = OCR_ENABLED
+    do_barcode = True
     upload = file or image
     if upload is None:
         raise HTTPException(status_code=400, detail=problem_detail("missing_image", "No image uploaded. Use form field 'file' or 'image'."))
@@ -1426,12 +1808,12 @@ async def analyze_image(
 
     ocr_payload = None
     ocr_error = None
-    if doOcr:
-        ocr_payload, ocr_error = await run_ocr(pil_image, ocrLang, ocrPsm)
+    if do_ocr:
+        ocr_payload, ocr_error = await run_ocr(pil_image, OCR_LANGUAGES, OCR_PSM)
 
     barcode_payload = None
     barcode_error = None
-    if doBarcode:
+    if do_barcode:
         barcode_payload, barcode_error = await run_barcode_scan(pil_image)
 
     scanned_barcodes = normalize_barcodes((barcode_payload or {}).get("barcodes"))
@@ -1443,21 +1825,27 @@ async def analyze_image(
         "IMAGE_ANALYZE",
         {
             "input": {"sha256": sha256_hex(raw), "bytes": len(raw), "contentType": getattr(upload, "content_type", None)},
-            "ocrEnabled": doOcr,
-            "barcodeEnabled": doBarcode,
+            "ocrEnabled": do_ocr,
+            "barcodeEnabled": do_barcode,
             "ocrError": ocr_error,
             "barcodeError": barcode_error,
         },
         request_id=request_id,
+        tenant_id=identity.tenant_id,
     )
 
     response = with_request_id(
         request,
         {
-            "governance": governance_meta(ocrEnabled=doOcr, barcodeEnabled=doBarcode),
+            "governance": governance_meta(ocrEnabled=do_ocr, barcodeEnabled=do_barcode),
             "image": image_info(pil_image, upload),
             "input": {"sha256": sha256_hex(raw), "bytes": len(raw), "contentType": getattr(upload, "content_type", None)},
-            "embedding": image_embedding_for(pil_image),
+            "model": {
+                "modelId": MODEL_NAME,
+                "modelRevision": MODEL_REVISION,
+                "embeddingDimension": len(image_embedding_for(pil_image)),
+                "device": INFERENCE_DEVICE,
+            },
             "ocr": ocr_payload,
             "ocrError": ocr_error,
             "barcode": {"barcodes": combined_barcodes, "meta": (barcode_payload or {}).get("meta")} if combined_barcodes or barcode_payload else None,
@@ -1474,31 +1862,33 @@ async def analyze_image(
 async def upsert_item(request: Request):
     started = time.time()
     endpoint = "/items"
-    require_auth(request.headers.get("Authorization"))
+    identity = authorize(request, "corpus:write")
     parsed_payload = await parse_items_request(request)
     upload = parsed_payload.pop("upload", None)
     normalized_patch = parse_item_payload(parsed_payload)
 
-    existing = get_repository().get_item(normalized_patch["id"])
-    stored_item = prepare_item_for_storage(existing, normalized_patch)
+    existing = get_repository().get_item(normalized_patch["id"], identity)
+    stored_item = prepare_item_for_storage(existing, normalized_patch, identity)
 
     if upload is not None:
         _, pil_image = await read_image_upload(upload, "file")
         stored_item["embedding"] = image_embedding_for(pil_image)
         stored_item["clipEmbedding"] = stored_item["embedding"]
+        stored_item["embeddingDimension"] = len(stored_item["embedding"])
         stored_item["image"] = image_info(pil_image, upload)
         stored_item["eligibleForMatching"] = bool(stored_item.get("released")) and True
         stored_item["status"] = "released" if stored_item["eligibleForMatching"] else "stored"
 
     saved_item = get_repository().upsert_item(stored_item)
     get_repository().add_audit_log(
-        "ITEM_UPSERT",
+        "corpus_creation" if existing is None else "corpus_update",
         {"status": saved_item.get("status"), "released": saved_item.get("released"), "hasEmbedding": bool(saved_item.get("embedding"))},
         item_id=saved_item["id"],
         request_id=get_request_id(request),
+        tenant_id=identity.tenant_id,
     )
 
-    response = with_request_id(request, {"governance": governance_meta(), "item": serialize_item(saved_item, include_embedding=True)})
+    response = with_request_id(request, {"governance": governance_meta(), "item": serialize_item(saved_item)})
     record_latency_metric(endpoint, started)
     record_request_metric(endpoint, 200)
     return response
@@ -1509,28 +1899,29 @@ def list_items(
     request: Request,
     status: Optional[str] = Query(default=None),
     limit: int = Query(default=500, ge=1, le=5000),
-    authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization)
-    items = [serialize_item(item, include_embedding=True) for item in get_repository().list_items(status=status, limit=limit)]
+    identity = authorize(request, "corpus:read")
+    if status not in {None, "stored", "released", "archived", "draft"}:
+        raise HTTPException(status_code=400, detail=problem_detail("invalid_status", "Invalid corpus status filter."))
+    items = [serialize_item(item) for item in get_repository().list_items(identity, status=status, limit=limit)]
     return with_request_id(request, {"items": items})
 
 
 @app.get("/items/{item_id}")
-def get_item(request: Request, item_id: str, authorization: Optional[str] = Header(default=None)):
-    require_auth(authorization)
-    item = get_repository().get_item(item_id)
+def get_item(request: Request, item_id: str):
+    identity = authorize(request, "corpus:read")
+    item = get_repository().get_item(item_id, identity)
     if item is None:
         raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
-    return with_request_id(request, {"item": serialize_item(item, include_embedding=True)})
+    return with_request_id(request, {"item": serialize_item(item)})
 
 
 @app.post("/items/{item_id}/release")
-def release_item(request: Request, item_id: str, authorization: Optional[str] = Header(default=None)):
+def release_item(request: Request, item_id: str):
     started = time.time()
     endpoint = "/items/release"
-    require_auth(authorization)
-    existing = get_repository().get_item(item_id)
+    identity = authorize(request, "corpus:release")
+    existing = get_repository().get_item(item_id, identity)
     if existing is None:
         raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
     if not existing.get("embedding"):
@@ -1538,6 +1929,9 @@ def release_item(request: Request, item_id: str, authorization: Optional[str] = 
             status_code=409,
             detail=problem_detail("item_not_matchable", f"Item '{item_id}' cannot be released without an embedding or image."),
         )
+    validate_stored_embedding(existing["embedding"])
+    if existing.get("modelId") != MODEL_NAME or existing.get("modelRevision") != MODEL_REVISION:
+        raise HTTPException(status_code=409, detail=problem_detail("model_incompatible", "Corpus item model is incompatible."))
     existing["released"] = True
     existing["eligibleForMatching"] = True
     existing["status"] = "released"
@@ -1545,15 +1939,55 @@ def release_item(request: Request, item_id: str, authorization: Optional[str] = 
     existing["updatedAt"] = now_iso()
     saved_item = get_repository().upsert_item(existing)
     get_repository().add_audit_log(
-        "ITEM_RELEASE",
+        "corpus_release",
         {"status": "released", "releasedAt": saved_item.get("releasedAt")},
         item_id=item_id,
         request_id=get_request_id(request),
+        tenant_id=identity.tenant_id,
     )
-    response = with_request_id(request, {"item": serialize_item(saved_item, include_embedding=True)})
+    response = with_request_id(request, {"item": serialize_item(saved_item)})
     record_latency_metric(endpoint, started)
     record_request_metric(endpoint, 200)
     return response
+
+
+@app.delete("/items/{item_id}")
+def remove_item(request: Request, item_id: str):
+    identity = authorize(request, "corpus:write")
+    if not get_repository().delete_item(item_id, identity):
+        raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
+    get_repository().add_audit_log(
+        "corpus_removal",
+        {},
+        item_id=item_id,
+        request_id=get_request_id(request),
+        tenant_id=identity.tenant_id,
+    )
+    return with_request_id(request, {"removed": True, "itemId": item_id})
+
+
+@app.post("/items/{item_id}/re-embed")
+async def reembed_item(request: Request, item_id: str, file: UploadFile = File(...)):
+    identity = authorize(request, "corpus:write")
+    existing = get_repository().get_item(item_id, identity)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
+    _, image = await read_image_upload(file, "file")
+    existing["embedding"] = image_embedding_for(image)
+    existing["clipEmbedding"] = existing["embedding"]
+    existing["embeddingDimension"] = len(existing["embedding"])
+    existing["modelId"] = MODEL_NAME
+    existing["modelRevision"] = MODEL_REVISION
+    existing["updatedAt"] = now_iso()
+    saved = get_repository().upsert_item(existing)
+    get_repository().add_audit_log(
+        "re_embedding",
+        {"modelId": MODEL_NAME, "modelRevision": MODEL_REVISION},
+        item_id=item_id,
+        request_id=get_request_id(request),
+        tenant_id=identity.tenant_id,
+    )
+    return with_request_id(request, {"item": serialize_item(saved)})
 
 
 @app.get("/audit-logs")
@@ -1562,10 +1996,9 @@ def list_audit_logs(
     itemId: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    authorization: Optional[str] = Header(default=None),
 ):
-    require_auth(authorization)
-    logs = get_repository().list_audit_logs(item_id=itemId, limit=limit, offset=offset)
+    identity = authorize(request, "corpus:read")
+    logs = get_repository().list_audit_logs(identity, item_id=itemId, limit=limit, offset=offset)
     return with_request_id(request, {"logs": logs})
 
 
@@ -1573,7 +2006,7 @@ def list_audit_logs(
 async def match(request: Request):
     started = time.time()
     endpoint = "/match"
-    require_auth(request.headers.get("Authorization"))
+    identity = authorize(request, "match:execute")
     form = await request.form()
 
     upload_value = first_value(form, "file", "image")
@@ -1612,9 +2045,9 @@ async def match(request: Request):
     query_ocr_text = parsed_request.ocrText or ((query_ocr_payload or {}).get("fullText"))
 
     if parsed_request.status == "released":
-        candidates = get_repository().list_released_items(limit=5000)
+        candidates = get_repository().list_released_items(identity, limit=CORPUS_LIMIT)
     else:
-        candidates = [item for item in get_repository().list_items(status=parsed_request.status, limit=5000) if item.get("embedding")]
+        candidates = []
 
     ranked: List[Dict[str, Any]] = []
     for candidate in candidates:
@@ -1653,17 +2086,18 @@ async def match(request: Request):
             )
 
     get_repository().add_audit_log(
-        "AI_MATCH_GENERATION",
+        "match_execution",
         {
             "topK": parsed_request.topK,
-            "statusFilter": parsed_request.status,
-            "queryText": parsed_request.text,
+            "statusFilter": "released",
+            "queryTextPresent": bool(parsed_request.text),
             "resultIds": [result["item"]["id"] for result in results],
             "decisioning": {"noMatch": no_match, "meta": no_match_meta},
             "input": None if raw_bytes is None else {"sha256": sha256_hex(raw_bytes), "bytes": len(raw_bytes)},
             "metadata": parsed_request.metadata,
         },
         request_id=get_request_id(request),
+        tenant_id=identity.tenant_id,
     )
 
     query_type_parts: List[str] = []

@@ -83,3 +83,15 @@ def extract_ocr(
         "meta": {"lang": lang, "psm": int(psm)},
     }
 
+
+def ocr_dependency_ready(required_languages: str = "eng+ara") -> bool:
+    if pytesseract is None:
+        return False
+    try:
+        pytesseract.get_tesseract_version()
+        installed = set(pytesseract.get_languages(config=""))
+    except Exception:
+        return False
+    required = {value for value in required_languages.split("+") if value}
+    return required.issubset(installed)
+
