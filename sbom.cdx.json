@@ -1,0 +1,592 @@
+{
+  "components": [
+    {
+      "bom-ref": "requirements-L3",
+      "description": "requirements line 3: fastapi==0.141.1",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/fastapi/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/fastapi/"
+        }
+      ],
+      "name": "fastapi",
+      "purl": "pkg:pypi/fastapi@0.141.1",
+      "type": "library",
+      "version": "0.141.1"
+    },
+    {
+      "bom-ref": "requirements-L20",
+      "description": "requirements line 20: ftfy==6.3.1",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/ftfy/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/ftfy/"
+        }
+      ],
+      "name": "ftfy",
+      "purl": "pkg:pypi/ftfy@6.3.1",
+      "type": "library",
+      "version": "6.3.1"
+    },
+    {
+      "bom-ref": "requirements-L16",
+      "description": "requirements line 16: gunicorn==26.0.0",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/gunicorn/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/gunicorn/"
+        }
+      ],
+      "name": "gunicorn",
+      "purl": "pkg:pypi/gunicorn@26.0.0",
+      "type": "library",
+      "version": "26.0.0"
+    },
+    {
+      "bom-ref": "requirements-L6",
+      "description": "requirements line 6: httpx==0.28.1",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/httpx/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/httpx/"
+        }
+      ],
+      "name": "httpx",
+      "purl": "pkg:pypi/httpx@0.28.1",
+      "type": "library",
+      "version": "0.28.1"
+    },
+    {
+      "bom-ref": "requirements-L17",
+      "description": "requirements line 17: numpy==2.4.4",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/numpy/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/numpy/"
+        }
+      ],
+      "name": "numpy",
+      "purl": "pkg:pypi/numpy@2.4.4",
+      "type": "library",
+      "version": "2.4.4"
+    },
+    {
+      "bom-ref": "requirements-L5",
+      "description": "requirements line 5: pillow==12.3.0",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/pillow/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/pillow/"
+        }
+      ],
+      "name": "pillow",
+      "purl": "pkg:pypi/pillow@12.3.0",
+      "type": "library",
+      "version": "12.3.0"
+    },
+    {
+      "bom-ref": "requirements-L9",
+      "description": "requirements line 9: prometheus-client==0.26.0",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/prometheus-client/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/prometheus-client/"
+        }
+      ],
+      "name": "prometheus-client",
+      "purl": "pkg:pypi/prometheus-client@0.26.0",
+      "type": "library",
+      "version": "0.26.0"
+    },
+    {
+      "bom-ref": "requirements-L19",
+      "description": "requirements line 19: pymongo==4.17.0",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/pymongo/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/pymongo/"
+        }
+      ],
+      "name": "pymongo",
+      "purl": "pkg:pypi/pymongo@4.17.0",
+      "type": "library",
+      "version": "4.17.0"
+    },
+    {
+      "bom-ref": "requirements-L7",
+      "description": "requirements line 7: pytesseract==0.3.13",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/pytesseract/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/pytesseract/"
+        }
+      ],
+      "name": "pytesseract",
+      "purl": "pkg:pypi/pytesseract@0.3.13",
+      "type": "library",
+      "version": "0.3.13"
+    },
+    {
+      "bom-ref": "requirements-L15",
+      "description": "requirements line 15: python-multipart==0.0.32",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/python-multipart/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/python-multipart/"
+        }
+      ],
+      "name": "python-multipart",
+      "purl": "pkg:pypi/python-multipart@0.0.32",
+      "type": "library",
+      "version": "0.0.32"
+    },
+    {
+      "bom-ref": "requirements-L21",
+      "description": "requirements line 21: regex==2026.7.19",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/regex/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/regex/"
+        }
+      ],
+      "name": "regex",
+      "purl": "pkg:pypi/regex@2026.7.19",
+      "type": "library",
+      "version": "2026.7.19"
+    },
+    {
+      "bom-ref": "requirements-L18",
+      "description": "requirements line 18: scikit-learn==1.9.0",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/scikit-learn/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/scikit-learn/"
+        }
+      ],
+      "name": "scikit-learn",
+      "purl": "pkg:pypi/scikit-learn@1.9.0",
+      "type": "library",
+      "version": "1.9.0"
+    },
+    {
+      "bom-ref": "requirements-L14",
+      "description": "requirements line 14: sentence-transformers==5.7.0",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/sentence-transformers/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/sentence-transformers/"
+        }
+      ],
+      "name": "sentence-transformers",
+      "purl": "pkg:pypi/sentence-transformers@5.7.0",
+      "type": "library",
+      "version": "5.7.0"
+    },
+    {
+      "bom-ref": "requirements-L11",
+      "description": "requirements line 11: torch==2.6.0+cpu",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/torch/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/torch/"
+        }
+      ],
+      "name": "torch",
+      "purl": "pkg:pypi/torch@2.6.0%2Bcpu",
+      "type": "library",
+      "version": "2.6.0+cpu"
+    },
+    {
+      "bom-ref": "requirements-L13",
+      "description": "requirements line 13: torchaudio==2.6.0+cpu",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/torchaudio/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/torchaudio/"
+        }
+      ],
+      "name": "torchaudio",
+      "purl": "pkg:pypi/torchaudio@2.6.0%2Bcpu",
+      "type": "library",
+      "version": "2.6.0+cpu"
+    },
+    {
+      "bom-ref": "requirements-L12",
+      "description": "requirements line 12: torchvision==0.21.0+cpu",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/torchvision/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/torchvision/"
+        }
+      ],
+      "name": "torchvision",
+      "purl": "pkg:pypi/torchvision@0.21.0%2Bcpu",
+      "type": "library",
+      "version": "0.21.0+cpu"
+    },
+    {
+      "bom-ref": "requirements-L22",
+      "description": "requirements line 22: tqdm==4.70.0",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/tqdm/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/tqdm/"
+        }
+      ],
+      "name": "tqdm",
+      "purl": "pkg:pypi/tqdm@4.70.0",
+      "type": "library",
+      "version": "4.70.0"
+    },
+    {
+      "bom-ref": "requirements-L10",
+      "description": "requirements line 10: transformers==5.14.1",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/transformers/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/transformers/"
+        }
+      ],
+      "name": "transformers",
+      "purl": "pkg:pypi/transformers@5.14.1",
+      "type": "library",
+      "version": "5.14.1"
+    },
+    {
+      "bom-ref": "requirements-L23",
+      "description": "requirements line 23: git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6",
+      "externalReferences": [
+        {
+          "comment": "explicit dist url",
+          "type": "vcs",
+          "url": "git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6"
+        }
+      ],
+      "name": "unknown",
+      "type": "library"
+    },
+    {
+      "bom-ref": "requirements-L4",
+      "description": "requirements line 4: uvicorn==0.52.1",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/uvicorn/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/uvicorn/"
+        }
+      ],
+      "name": "uvicorn",
+      "purl": "pkg:pypi/uvicorn@0.52.1",
+      "type": "library",
+      "version": "0.52.1"
+    },
+    {
+      "bom-ref": "requirements-L8",
+      "description": "requirements line 8: zxing-cpp==3.1.1",
+      "externalReferences": [
+        {
+          "comment": "implicit dist extra-url",
+          "type": "distribution",
+          "url": "https://download.pytorch.org/whl/cpu/zxing-cpp/"
+        },
+        {
+          "comment": "implicit dist url",
+          "type": "distribution",
+          "url": "https://pypi.org/simple/zxing-cpp/"
+        }
+      ],
+      "name": "zxing-cpp",
+      "purl": "pkg:pypi/zxing-cpp@3.1.1",
+      "type": "library",
+      "version": "3.1.1"
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "requirements-L10"
+    },
+    {
+      "ref": "requirements-L11"
+    },
+    {
+      "ref": "requirements-L12"
+    },
+    {
+      "ref": "requirements-L13"
+    },
+    {
+      "ref": "requirements-L14"
+    },
+    {
+      "ref": "requirements-L15"
+    },
+    {
+      "ref": "requirements-L16"
+    },
+    {
+      "ref": "requirements-L17"
+    },
+    {
+      "ref": "requirements-L18"
+    },
+    {
+      "ref": "requirements-L19"
+    },
+    {
+      "ref": "requirements-L20"
+    },
+    {
+      "ref": "requirements-L21"
+    },
+    {
+      "ref": "requirements-L22"
+    },
+    {
+      "ref": "requirements-L23"
+    },
+    {
+      "ref": "requirements-L3"
+    },
+    {
+      "ref": "requirements-L4"
+    },
+    {
+      "ref": "requirements-L5"
+    },
+    {
+      "ref": "requirements-L6"
+    },
+    {
+      "ref": "requirements-L7"
+    },
+    {
+      "ref": "requirements-L8"
+    },
+    {
+      "ref": "requirements-L9"
+    }
+  ],
+  "metadata": {
+    "timestamp": "2026-08-06T16:16:53.079176+00:00",
+    "tools": {
+      "components": [
+        {
+          "description": "CycloneDX Software Bill of Materials (SBOM) generator for Python projects and environments",
+          "externalReferences": [
+            {
+              "type": "build-system",
+              "url": "https://github.com/CycloneDX/cyclonedx-python/actions"
+            },
+            {
+              "type": "distribution",
+              "url": "https://pypi.org/project/cyclonedx-bom/"
+            },
+            {
+              "type": "documentation",
+              "url": "https://cyclonedx-bom-tool.readthedocs.io/"
+            },
+            {
+              "type": "issue-tracker",
+              "url": "https://github.com/CycloneDX/cyclonedx-python/issues"
+            },
+            {
+              "type": "license",
+              "url": "https://github.com/CycloneDX/cyclonedx-python/blob/main/LICENSE"
+            },
+            {
+              "type": "release-notes",
+              "url": "https://github.com/CycloneDX/cyclonedx-python/blob/main/CHANGELOG.md"
+            },
+            {
+              "type": "vcs",
+              "url": "https://github.com/CycloneDX/cyclonedx-python/"
+            },
+            {
+              "type": "website",
+              "url": "https://github.com/CycloneDX/cyclonedx-python/#readme"
+            }
+          ],
+          "group": "CycloneDX",
+          "licenses": [
+            {
+              "license": {
+                "acknowledgement": "declared",
+                "id": "Apache-2.0"
+              }
+            }
+          ],
+          "name": "cyclonedx-py",
+          "type": "application",
+          "version": "7.3.1"
+        },
+        {
+          "description": "Python library for CycloneDX",
+          "externalReferences": [
+            {
+              "type": "build-system",
+              "url": "https://github.com/CycloneDX/cyclonedx-python-lib/actions"
+            },
+            {
+              "type": "distribution",
+              "url": "https://pypi.org/project/cyclonedx-python-lib/"
+            },
+            {
+              "type": "documentation",
+              "url": "https://cyclonedx-python-library.readthedocs.io/"
+            },
+            {
+              "type": "issue-tracker",
+              "url": "https://github.com/CycloneDX/cyclonedx-python-lib/issues"
+            },
+            {
+              "type": "license",
+              "url": "https://github.com/CycloneDX/cyclonedx-python-lib/blob/main/LICENSE"
+            },
+            {
+              "type": "release-notes",
+              "url": "https://github.com/CycloneDX/cyclonedx-python-lib/blob/main/CHANGELOG.md"
+            },
+            {
+              "type": "vcs",
+              "url": "https://github.com/CycloneDX/cyclonedx-python-lib"
+            },
+            {
+              "type": "website",
+              "url": "https://github.com/CycloneDX/cyclonedx-python-lib/#readme"
+            }
+          ],
+          "group": "CycloneDX",
+          "licenses": [
+            {
+              "license": {
+                "acknowledgement": "declared",
+                "id": "Apache-2.0"
+              }
+            }
+          ],
+          "name": "cyclonedx-python-lib",
+          "type": "library",
+          "version": "11.11.0"
+        }
+      ]
+    }
+  },
+  "serialNumber": "urn:uuid:b1fed635-da8e-4377-ba58-7563c6b71215",
+  "version": 1,
+  "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6"
+}

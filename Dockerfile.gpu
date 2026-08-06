@@ -1,0 +1,35 @@
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    INFERENCE_DEVICE=cuda \
+    STORAGE_MODE=mongodb \
+    HF_HOME=/opt/huggingface
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    python3 \
+    python3-pip \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-ara \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 10001 appuser
+WORKDIR /app
+COPY requirements-gpu.txt .
+RUN python3 -m pip install --no-cache-dir -r requirements-gpu.txt
+COPY . .
+RUN mkdir -p /opt/huggingface && chown -R appuser:appuser /opt/huggingface /app
+
+USER appuser
+ENV PORT=8080
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD curl --fail http://127.0.0.1:${PORT}/health/live || exit 1
+
+CMD ["sh", "-c", "exec python3 -m uvicorn app:app --host 0.0.0.0 --port ${PORT}"]

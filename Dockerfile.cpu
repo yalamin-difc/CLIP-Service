@@ -1,0 +1,31 @@
+FROM python:3.12.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    INFERENCE_DEVICE=cpu \
+    STORAGE_MODE=mongodb \
+    HF_HOME=/opt/huggingface
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-ara \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 10001 appuser
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN mkdir -p /opt/huggingface && chown -R appuser:appuser /opt/huggingface /app
+
+USER appuser
+ENV PORT=8080
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD curl --fail http://127.0.0.1:${PORT}/health/live || exit 1
+
+CMD ["sh", "-c", "exec uvicorn app:app --host 0.0.0.0 --port ${PORT}"]
