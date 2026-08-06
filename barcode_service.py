@@ -10,6 +10,23 @@ except Exception:  # pragma: no cover
     zxingcpp = None
 
 
+def _serialize_position(position: Any) -> Any:
+    if position is None:
+        return None
+    corners = ("top_left", "top_right", "bottom_right", "bottom_left")
+    if all(hasattr(position, corner) for corner in corners):
+        return {
+            corner: {
+                "x": int(getattr(getattr(position, corner), "x", 0)),
+                "y": int(getattr(getattr(position, corner), "y", 0)),
+            }
+            for corner in corners
+        }
+    if isinstance(position, (str, int, float, bool, list, tuple, dict)):
+        return position
+    return str(position)
+
+
 def scan_barcodes(image: Image.Image) -> Dict[str, Any]:
     """
     ZXing-backed barcode scan (via `zxing-cpp` python bindings).
@@ -37,7 +54,7 @@ def scan_barcodes(image: Image.Image) -> Dict[str, Any]:
                 "text": getattr(r, "text", None) or getattr(r, "data", None) or "",
                 "format": str(getattr(r, "format", "") or ""),
                 "contentType": str(getattr(r, "content_type", "") or getattr(r, "contentType", "") or ""),
-                "position": getattr(r, "position", None) or getattr(r, "points", None),
+                "position": _serialize_position(getattr(r, "position", None) or getattr(r, "points", None)),
             }
         )
 
