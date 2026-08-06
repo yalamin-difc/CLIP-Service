@@ -24,7 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from internal_auth import ServiceIdentity, require_identity
+from internal_auth import ServiceIdentity, require_identity, validate_auth_configuration
 
 try:  # pragma: no cover - optional runtime dependency
     from barcode_service import scan_barcodes as _scan_barcodes
@@ -755,6 +755,12 @@ def _move_inputs_to_device(inputs: Mapping[str, Any]) -> Dict[str, Any]:
     return {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
 
 
+def _feature_tensor(value: Any) -> Any:
+    """Normalize Transformers 4.x tensor and 5.x model-output return shapes."""
+    pooled = getattr(value, "pooler_output", None)
+    return pooled if pooled is not None else value
+
+
 def load_model():
     global model, processor, model_load_error
     if model is None or processor is None:
@@ -872,7 +878,7 @@ def image_embedding_for(image: Image.Image) -> List[float]:
     try:
         inputs = _move_inputs_to_device(processor_instance(images=image, return_tensors="pt"))
         with inference_mode():
-            features = model_instance.get_image_features(**inputs)
+            features = _feature_tensor(model_instance.get_image_features(**inputs))
     except HTTPException:
         raise
     except Exception as exc:
@@ -888,7 +894,7 @@ def text_embedding_for(text: str) -> List[float]:
     try:
         inputs = _move_inputs_to_device(processor_instance(text=[text], return_tensors="pt", padding=True))
         with inference_mode():
-            features = model_instance.get_text_features(**inputs)
+            features = _feature_tensor(model_instance.get_text_features(**inputs))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1683,6 +1689,7 @@ def health_ready(request: Request):
 
 
 def initialize_runtime() -> None:
+    validate_auth_configuration()
     configured_device()
     store = get_repository()
     if not store.health().get("ok"):
@@ -1841,6 +1848,13 @@ async def analyze_image(
         request_id=request_id,
         tenant_id=identity.tenant_id,
     )
+    if ocr_error:
+        get_repository().add_audit_log(
+            "ocr_failure",
+            {"reason": ocr_error, "inputSha256": sha256_hex(raw)},
+            request_id=request_id,
+            tenant_id=identity.tenant_id,
+        )
 
     response = with_request_id(
         request,
@@ -2102,11 +2116,17 @@ async def match(request: Request):
             "resultIds": [result["item"]["id"] for result in results],
             "decisioning": {"noMatch": no_match, "meta": no_match_meta},
             "input": None if raw_bytes is None else {"sha256": sha256_hex(raw_bytes), "bytes": len(raw_bytes)},
-            "metadata": parsed_request.metadata,
         },
         request_id=get_request_id(request),
         tenant_id=identity.tenant_id,
     )
+    if query_ocr_error:
+        get_repository().add_audit_log(
+            "ocr_failure",
+            {"reason": query_ocr_error, "inputSha256": sha256_hex(raw_bytes or b"")},
+            request_id=get_request_id(request),
+            tenant_id=identity.tenant_id,
+        )
 
     query_type_parts: List[str] = []
     if upload is not None:

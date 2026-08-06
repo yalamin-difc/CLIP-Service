@@ -5,13 +5,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import resource
 import statistics
+import sys
 import time
 from typing import Any, Dict, List
 
 import numpy as np
 from PIL import Image
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import app
 

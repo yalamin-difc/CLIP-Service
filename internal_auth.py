@@ -42,8 +42,13 @@ def _auth_error(status: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail={"code": code, "message": message})
 
 
+def validate_auth_configuration() -> None:
+    if len(INTERNAL_JWT_SECRET.encode("utf-8")) < 32:
+        raise RuntimeError("INTERNAL_JWT_SECRET must contain at least 32 bytes")
+
+
 def decode_internal_jwt(token: str) -> Dict[str, Any]:
-    if not INTERNAL_JWT_SECRET:
+    if len(INTERNAL_JWT_SECRET.encode("utf-8")) < 32:
         raise _auth_error(503, "internal_auth_misconfigured", "Internal service authentication is not configured.")
     try:
         encoded_header, encoded_payload, encoded_signature = token.split(".")
