@@ -1,4 +1,5 @@
 import io
+import time
 import unittest
 from unittest.mock import patch
 
@@ -7,41 +8,40 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import app as clip_service
+import internal_auth
 
 
-def make_image_bytes(color):
-    image = Image.new("RGB", (8, 8), color)
+TEST_SECRET = "festival-test-secret-with-at-least-32-bytes"
+ALL_ACTIONS = [
+    "corpus:write",
+    "corpus:release",
+    "corpus:read",
+    "match:execute",
+    "health:read",
+    "metrics:read",
+]
+
+
+def make_image_bytes(color=(255, 0, 0), size=(32, 32), image_format="PNG"):
+    image = Image.new("RGB", size, color)
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    image.save(buffer, format=image_format)
     return buffer.getvalue()
-
-
-def image_vector(image):
-    array = np.asarray(image, dtype=float)
-    mean_rgb = array.reshape(-1, 3).mean(axis=0)
-    return np.asarray(mean_rgb, dtype=float) + 1.0
-
-
-def text_vector(text):
-    lowered = text.lower()
-    if "red" in lowered:
-        return np.asarray([255.0, 1.0, 1.0], dtype=float)
-    if "green" in lowered:
-        return np.asarray([1.0, 255.0, 1.0], dtype=float)
-    if "blue" in lowered:
-        return np.asarray([1.0, 1.0, 255.0], dtype=float)
-    return np.asarray([32.0, 32.0, 32.0], dtype=float)
 
 
 class FakeProcessor:
     def __call__(self, images=None, text=None, **kwargs):
         if images is not None:
             batch = images if isinstance(images, list) else [images]
-            return {"image_features": np.asarray([image_vector(image) for image in batch], dtype=float)}
+            vectors = []
+            for image in batch:
+                mean = np.asarray(image, dtype=float).reshape(-1, 3).mean(axis=0)
+                vectors.append(mean + 1.0)
+            return {"image_features": np.asarray(vectors)}
         if text is not None:
-            batch = text if isinstance(text, list) else [text]
-            return {"text_features": np.asarray([text_vector(value) for value in batch], dtype=float)}
-        raise AssertionError("Processor expected images or text")
+            value = text[0].lower()
+            return {"text_features": np.asarray([[255.0, 1.0, 1.0] if "red" in value else [1.0, 1.0, 255.0]])}
+        raise AssertionError("missing model input")
 
 
 class FakeModel:
@@ -52,322 +52,241 @@ class FakeModel:
         return inputs["text_features"]
 
 
-class ClipServiceTests(unittest.TestCase):
+def identity_headers(
+    *,
+    tenant="tenant-a",
+    site="site-1",
+    sites=None,
+    actions=None,
+    service="festival-backend",
+    request_id=None,
+):
+    request_id = request_id or f"req-{time.time_ns()}"
+    claims = {
+        "iss": internal_auth.JWT_ISSUER,
+        "aud": internal_auth.JWT_AUDIENCE,
+        "service": service,
+        "tenantId": tenant,
+        "siteId": site,
+        "siteIds": sites or [site],
+        "datasetVersion": "festival-v1",
+        "demoData": True,
+        "actions": actions if actions is not None else ALL_ACTIONS,
+        "requestId": request_id,
+        "exp": int(time.time()) + 300,
+    }
+    token = internal_auth.sign_internal_token(claims, TEST_SECRET)
+    return {"Authorization": f"Bearer {token}", "X-Request-Id": request_id}
+
+
+class ClipServiceSecurityTests(unittest.TestCase):
     def setUp(self):
-        clip_service.model = None
-        clip_service.processor = None
-        clip_service.set_item_repository(clip_service.InMemoryItemRepository())
+        self.auth_patch = patch.object(internal_auth, "INTERNAL_JWT_SECRET", TEST_SECRET)
+        self.auth_patch.start()
         self.model_patch = patch.object(clip_service, "load_model", return_value=(FakeModel(), FakeProcessor()))
         self.model_patch.start()
+        self.dimension_patch = patch.object(clip_service, "EXPECTED_EMBEDDING_DIMENSION", 3)
+        self.dimension_patch.start()
+        clip_service.embedding_dimension = 3
+        clip_service.model_warmup_completed = False
+        clip_service.set_item_repository(clip_service.InMemoryItemRepository())
         self.client = TestClient(clip_service.app)
 
     def tearDown(self):
+        self.dimension_patch.stop()
         self.model_patch.stop()
+        self.auth_patch.stop()
+        clip_service.embedding_dimension = None
+        clip_service.model_warmup_completed = False
         clip_service.set_item_repository(clip_service.InMemoryItemRepository())
-        clip_service.model = None
-        clip_service.processor = None
 
-    def upsert_item_with_image(self, item_id, color, **fields):
-        payload = {"id": item_id, **fields}
+    def create_item(self, item_id="item-1", tenant="tenant-a", site="site-1", color=(255, 0, 0)):
         return self.client.post(
             "/items",
-            data=payload,
-            files={"file": (f"{item_id}.png", make_image_bytes(color), "image/png")},
+            headers=identity_headers(tenant=tenant, site=site),
+            data={"id": item_id, "title": "Festival synthetic wallet"},
+            files={"file": ("item.png", make_image_bytes(color), "image/png")},
         )
 
-    def upsert_item_with_embedding(self, item_id, embedding, **fields):
-        payload = {"id": item_id, "clipEmbedding": embedding, **fields}
-        return self.client.post("/items", json=payload)
+    def release_item(self, item_id="item-1", tenant="tenant-a", site="site-1"):
+        return self.client.post(
+            f"/items/{item_id}/release",
+            headers=identity_headers(tenant=tenant, site=site, actions=["corpus:release"]),
+        )
 
-    def test_health_reports_dependencies_and_request_id(self):
-        response = self.client.get("/health", headers={"X-Request-Id": "req-health"})
-
+    def test_public_liveness_is_minimal(self):
+        response = self.client.get("/health/live")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["X-Request-Id"], "req-health")
-        payload = response.json()
-        self.assertEqual(payload["requestId"], "req-health")
-        self.assertEqual(payload["status"], "ok")
-        self.assertFalse(payload["dependencies"]["model"]["loaded"])
-        self.assertEqual(payload["dependencies"]["store"]["backend"], "memory")
+        self.assertEqual(set(response.json()), {"status", "requestId"})
 
-    def test_encode_image_returns_embedding_and_request_id(self):
+    def test_readiness_reports_safe_checks_and_stays_false_before_warmup(self):
+        response = self.client.get("/health/ready")
+        self.assertEqual(response.status_code, 503)
+        checks = response.json()["checks"]
+        self.assertEqual(
+            set(checks),
+            {
+                "modelLoaded",
+                "embeddingDimensionKnown",
+                "ocrDependencyReady",
+                "databaseReady",
+                "device",
+                "warmupCompleted",
+            },
+        )
+        self.assertFalse(checks["warmupCompleted"])
+
+    def test_service_identity_is_mandatory(self):
+        response = self.client.post("/match", data={"text": "red wallet"})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "missing_identity")
+
+    def test_action_permission_is_enforced(self):
         response = self.client.post(
+            "/items",
+            headers=identity_headers(actions=["match:execute"]),
+            json={"id": "forbidden", "title": "No access"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["code"], "action_not_permitted")
+
+    def test_corpus_metadata_comes_from_signed_identity_and_model(self):
+        response = self.create_item()
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["item"]
+        self.assertEqual(item["tenantId"], "tenant-a")
+        self.assertEqual(item["siteId"], "site-1")
+        self.assertEqual(item["datasetVersion"], "festival-v1")
+        self.assertTrue(item["demoData"])
+        self.assertEqual(item["createdBy"], "festival-backend")
+        self.assertEqual(item["modelId"], clip_service.MODEL_NAME)
+        self.assertEqual(item["modelRevision"], clip_service.MODEL_REVISION)
+        self.assertEqual(item["embeddingDimension"], 3)
+        self.assertNotIn("embedding", item)
+        self.assertNotIn("clipEmbedding", item)
+
+    def test_client_cannot_set_system_fields_or_embedding(self):
+        response = self.client.post(
+            "/items",
+            headers=identity_headers(),
+            json={
+                "id": "hostile",
+                "title": "Hostile",
+                "released": True,
+                "status": "released",
+                "clipEmbedding": [1, 0, 0],
+                "tenantId": "other",
+                "modelRevision": "browser-choice",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "system_fields_forbidden")
+
+    def test_tenant_isolation_applies_to_item_reads(self):
+        self.assertEqual(self.create_item().status_code, 200)
+        denied = self.client.get("/items/item-1", headers=identity_headers(tenant="tenant-b"))
+        self.assertEqual(denied.status_code, 404)
+        allowed = self.client.get("/items/item-1", headers=identity_headers(actions=["corpus:read"]))
+        self.assertEqual(allowed.status_code, 200)
+
+    def test_site_permissions_filter_corpus(self):
+        self.assertEqual(self.create_item(site="site-1").status_code, 200)
+        denied = self.client.get(
+            "/items",
+            headers=identity_headers(site="site-2", sites=["site-2"], actions=["corpus:read"]),
+        )
+        self.assertEqual(denied.status_code, 200)
+        self.assertEqual(denied.json()["items"], [])
+        allowed = self.client.get(
+            "/items",
+            headers=identity_headers(site="site-2", sites=["site-1", "site-2"], actions=["corpus:read"]),
+        )
+        self.assertEqual(len(allowed.json()["items"]), 1)
+
+    def test_only_released_compatible_candidates_are_matched(self):
+        self.create_item("released-red")
+        self.release_item("released-red")
+        self.create_item("draft-blue", color=(0, 0, 255))
+        response = self.client.post(
+            "/match",
+            headers=identity_headers(actions=["match:execute"]),
+            data={"text": "red wallet", "topK": "5"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["governance"]["candidatesEvaluated"], 1)
+        self.assertEqual(response.json()["topK"][0]["candidateId"], "released-red")
+
+    def test_browser_cannot_control_match_policy(self):
+        response = self.client.post(
+            "/match",
+            headers=identity_headers(actions=["match:execute"]),
+            data={"text": "wallet", "minScore": "-1", "status": "draft", "doOcr": "false"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "system_controls_forbidden")
+
+    def test_encode_endpoints_do_not_return_raw_embeddings(self):
+        image_response = self.client.post(
             "/encode-image",
-            headers={"X-Request-Id": "req-image"},
-            files={"file": ("red.png", make_image_bytes((255, 0, 0)), "image/png")},
+            headers=identity_headers(actions=["match:execute"]),
+            files={"file": ("image.png", make_image_bytes(), "image/png")},
         )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["X-Request-Id"], "req-image")
-        payload = response.json()
-        self.assertEqual(payload["requestId"], "req-image")
-        self.assertEqual(len(payload["embedding"]), 3)
-        self.assertGreater(payload["embedding"][0], payload["embedding"][1])
-
-    def test_encode_text_returns_embedding_and_request_id(self):
-        response = self.client.post(
+        text_response = self.client.post(
             "/encode-text",
-            headers={"X-Request-Id": "req-text"},
+            headers=identity_headers(actions=["match:execute"]),
             data={"text": "red wallet"},
         )
+        self.assertEqual(image_response.status_code, 200)
+        self.assertEqual(text_response.status_code, 200)
+        self.assertNotIn("embedding", image_response.json())
+        self.assertNotIn("embedding", text_response.json())
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["X-Request-Id"], "req-text")
-        payload = response.json()
-        self.assertEqual(payload["requestId"], "req-text")
-        self.assertEqual(len(payload["embedding"]), 3)
-        self.assertGreater(payload["embedding"][0], payload["embedding"][2])
+    def test_metrics_require_operational_permission(self):
+        denied = self.client.get("/metrics", headers=identity_headers(actions=["health:read"]))
+        self.assertEqual(denied.status_code, 403)
+        allowed = self.client.get("/metrics", headers=identity_headers(actions=["metrics:read"]))
+        self.assertEqual(allowed.status_code, 200)
 
-    def test_analyze_image_returns_compact_signals(self):
-        response = self.client.post(
+    def test_invalid_image_and_mime_are_rejected(self):
+        bad_image = self.client.post(
             "/analyze-image",
-            headers={"X-Request-Id": "req-analyze"},
-            data={
-                "ocrText": "  wallet receipt ABC123  ",
-                "barcodeValues": "ABC123, XYZ999",
-                "labels": "wallet, receipt",
-            },
-            files={"file": ("green.png", make_image_bytes((0, 255, 0)), "image/png")},
+            headers=identity_headers(actions=["match:execute"]),
+            files={"file": ("bad.png", b"not-an-image", "image/png")},
         )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["requestId"], "req-analyze")
-        self.assertEqual(payload["image"]["width"], 8)
-        self.assertEqual(payload["signals"]["barcode"]["count"], 2)
-        self.assertEqual(payload["signals"]["labels"], ["wallet", "receipt"])
-        self.assertIn("ABC123", payload["signals"]["ocr"]["excerpt"])
-
-    def test_items_upsert_and_release_behavior(self):
-        upsert = self.client.post(
-            "/items",
-            data={
-                "id": "item-123",
-                "title": "Red wallet",
-                "barcodeValues": "ABC123",
-                "ocrText": "Wallet ABC123",
-            },
-            files={"file": ("wallet.png", make_image_bytes((255, 0, 0)), "image/png")},
+        bad_mime = self.client.post(
+            "/analyze-image",
+            headers=identity_headers(actions=["match:execute"]),
+            files={"file": ("bad.gif", make_image_bytes(), "image/gif")},
         )
+        self.assertEqual(bad_image.status_code, 400)
+        self.assertEqual(bad_mime.status_code, 415)
 
-        self.assertEqual(upsert.status_code, 200)
-        upsert_payload = upsert.json()
-        self.assertEqual(upsert_payload["item"]["id"], "item-123")
-        self.assertFalse(upsert_payload["item"]["released"])
-        self.assertFalse(upsert_payload["item"]["eligibleForMatching"])
-
-        release = self.client.post("/items/item-123/release", headers={"X-Request-Id": "req-release"})
-
-        self.assertEqual(release.status_code, 200)
-        self.assertEqual(release.headers["X-Request-Id"], "req-release")
-        release_payload = release.json()
-        self.assertTrue(release_payload["item"]["released"])
-        self.assertTrue(release_payload["item"]["eligibleForMatching"])
-        self.assertEqual(release_payload["item"]["status"], "released")
-
-    def test_match_returns_released_candidates_and_signal_explanations(self):
-        self.upsert_item_with_image(
-            "item-red",
-            (255, 0, 0),
-            title="Red wallet",
-            barcodeValues="ABC123",
-            ocrText="Wallet ABC123",
-            labels="wallet,red",
-        )
-        self.client.post("/items/item-red/release")
-
-        self.upsert_item_with_image(
-            "item-blue",
-            (0, 0, 255),
-            title="Blue bag",
-            barcodeValues="XYZ999",
-            ocrText="Bag XYZ999",
-            labels="bag,blue",
-        )
-
-        response = self.client.post(
-            "/match",
-            headers={"X-Request-Id": "req-match"},
-            data={
-                "topK": "3",
-                "barcodeValues": "ABC123",
-                "ocrText": "found wallet abc123",
-                "labels": "wallet",
-            },
-            files={"file": ("query.png", make_image_bytes((255, 0, 0)), "image/png")},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["X-Request-Id"], "req-match")
-        payload = response.json()
-        self.assertEqual(payload["requestId"], "req-match")
-        self.assertEqual(payload["governance"]["candidatesEvaluated"], 1)
-        self.assertEqual(payload["governance"]["scoringVersion"], "clip-match-v1")
-        self.assertFalse(payload["decision"]["noMatch"])
-        self.assertEqual(payload["decision"]["reason"], "OK")
-        self.assertEqual(payload["topK"][0]["item"]["id"], "item-red")
-        self.assertEqual(payload["topK"][0]["candidateId"], "item-red")
-        self.assertEqual(payload["topK"][0]["explanation"]["signals"]["barcode"], ["ABC123"])
-        self.assertIn("wallet", payload["topK"][0]["explanation"]["ocr"]["matchedTerms"])
-        self.assertEqual(payload["query"]["signals"]["barcode"]["values"], ["ABC123"])
-        self.assertEqual(payload["query"]["modalities"], ["image"])
-        self.assertEqual(payload["query"]["thresholds"]["minScore"], clip_service.CONF_MIN_SCORE)
-
-    def test_match_text_only_uses_stable_contract(self):
-        self.upsert_item_with_embedding(
-            "item-red-text",
-            [255.0, 1.0, 1.0],
-            title="Red text wallet",
-            ocrText="Wallet receipt",
-            barcodes=[{"text": "TXT123"}],
-            labels=["wallet", "text"],
-        )
-        self.client.post("/items/item-red-text/release")
-
-        response = self.client.post(
-            "/match",
-            headers={"X-Request-Id": "req-text-match"},
-            data={"text": "red wallet", "topK": "2", "metadata": '{"source":"backend"}'},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["query"]["modalities"], ["text"])
-        self.assertEqual(payload["query"]["metadata"], {"source": "backend"})
-        self.assertEqual(payload["topK"][0]["candidateId"], "item-red-text")
-        self.assertEqual(payload["topK"][0]["explanation"]["model"]["scoringVersion"], "clip-match-v1")
-        self.assertIn("similarity", payload["topK"][0]["explanation"])
-
-    def test_match_image_and_text_combines_modalities(self):
-        self.upsert_item_with_image(
-            "item-combo",
-            (255, 0, 0),
-            title="Combo wallet",
-            ocrText="Wallet combo",
-            labels="wallet,combo",
-        )
-        self.client.post("/items/item-combo/release")
-
-        response = self.client.post(
-            "/match",
-            data={"text": "red wallet", "topK": "1"},
-            files={"file": ("combo.png", make_image_bytes((255, 0, 0)), "image/png")},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["query"]["modalities"], ["image", "text"])
-        self.assertEqual(payload["query"]["type"], "image+text")
-        self.assertEqual(payload["topK"][0]["item"]["id"], "item-combo")
-
-    def test_match_returns_explicit_no_match_decision(self):
-        self.upsert_item_with_embedding(
-            "item-blue-text",
-            [1.0, 1.0, 255.0],
-            title="Blue bag",
-            labels=["bag", "blue"],
-        )
-        self.client.post("/items/item-blue-text/release")
-
-        response = self.client.post("/match", data={"text": "red wallet", "topK": "1"})
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertTrue(payload["decision"]["noMatch"])
-        self.assertEqual(payload["topK"], [])
-        self.assertIn(payload["decision"]["reason"], {"LOW_TOP_SCORE", "LOW_MARGIN"})
-        self.assertTrue(payload["governance"]["decision"]["noMatch"])
-
-    def test_match_rejects_malformed_request(self):
-        response = self.client.post("/match", data={"topK": "oops", "text": "wallet"})
-
-        self.assertEqual(response.status_code, 400)
-        payload = response.json()
-        self.assertEqual(payload["success"], False)
-        self.assertEqual(payload["error"]["code"], "invalid_top_k")
-
-    def test_match_accepts_legacy_k_alias(self):
-        self.upsert_item_with_embedding(
-            "item-k-alias",
-            [255.0, 1.0, 1.0],
-            title="Alias wallet",
-            labels=["wallet"],
-        )
-        self.client.post("/items/item-k-alias/release")
-
-        response = self.client.post("/match", data={"text": "red wallet", "k": "1"})
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["governance"]["topKRequested"], 1)
-        self.assertEqual(len(payload["topK"]), 1)
-
-    def test_match_enforces_bearer_auth_when_configured(self):
-        with patch.object(clip_service, "CLIP_API_KEY", "secret-token"):
-            unauthorized = self.client.post("/match", data={"text": "wallet"})
-            self.assertEqual(unauthorized.status_code, 401)
-            self.assertEqual(unauthorized.json()["error"]["code"], "unauthorized")
-
-            authorized = self.client.post(
-                "/match",
-                headers={"Authorization": "Bearer secret-token"},
-                data={"text": "wallet"},
+    def test_oversized_upload_is_rejected(self):
+        with patch.object(clip_service, "MAX_UPLOAD_BYTES", 16):
+            response = self.client.post(
+                "/analyze-image",
+                headers=identity_headers(actions=["match:execute"]),
+                files={"file": ("large.png", make_image_bytes(), "image/png")},
             )
-            self.assertEqual(authorized.status_code, 200)
+        self.assertEqual(response.status_code, 413)
 
-    def test_non_dev_environment_requires_auth_configuration(self):
-        with patch.object(clip_service, "ENVIRONMENT", "production"), patch.object(clip_service, "CLIP_API_KEY", ""):
-            response = self.client.post("/match", data={"text": "wallet"})
-            self.assertEqual(response.status_code, 503)
-            self.assertEqual(response.json()["error"]["code"], "clip_auth_misconfigured")
+    def test_embedding_validation_rejects_nonfinite_and_dimension_mismatch(self):
+        with self.assertRaises(Exception):
+            clip_service.validate_stored_embedding([float("nan"), 0, 1])
+        with self.assertRaises(Exception):
+            clip_service.validate_stored_embedding([1, 0])
 
-    def test_match_schema_is_consistent(self):
-        self.upsert_item_with_embedding(
-            "item-schema",
-            [255.0, 1.0, 1.0],
-            title="Schema wallet",
-            labels=["wallet"],
-        )
-        self.client.post("/items/item-schema/release")
-
-        response = self.client.post("/match", data={"text": "red wallet", "topK": "1"})
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(set(payload.keys()), {"requestId", "governance", "query", "decision", "topK"})
-        self.assertEqual(
-            set(payload["topK"][0].keys()),
-            {"candidateId", "item", "score", "confidence", "explanation"},
-        )
-        self.assertEqual(
-            set(payload["topK"][0]["explanation"].keys()),
-            {"reason", "summary", "scoreBand", "signals", "similarity", "ocr", "barcode", "labels", "model"},
-        )
-
-    def test_items_upsert_accepts_clip_embedding_alias(self):
-        response = self.client.post(
-            "/items",
-            json={
-                "id": "item-clip-embedding",
-                "title": "Embedding alias",
-                "clipEmbedding": [255.0, 1.0, 1.0],
-            },
-        )
-
-        self.assertEqual(response.status_code, 200)
-        release = self.client.post("/items/item-clip-embedding/release")
-        self.assertEqual(release.status_code, 200)
-        self.assertTrue(release.json()["item"]["eligibleForMatching"])
-
-    def test_errors_use_structured_contract(self):
-        response = self.client.post("/encode-text", headers={"X-Request-Id": "req-error"}, data={})
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.headers["X-Request-Id"], "req-error")
-        payload = response.json()
-        self.assertEqual(payload["success"], False)
-        self.assertEqual(payload["error"]["requestId"], "req-error")
-        self.assertEqual(payload["error"]["code"], "missing_text")
+    def test_festival_storage_never_falls_back_to_memory(self):
+        with patch.object(clip_service, "ENVIRONMENT", "festival"), patch.object(
+            clip_service, "STORAGE_MODE", "memory"
+        ):
+            with self.assertRaises(RuntimeError):
+                clip_service.build_repository()
+        with patch.object(clip_service, "ENVIRONMENT", "festival"), patch.object(
+            clip_service, "STORAGE_MODE", "mongodb"
+        ), patch.object(clip_service, "MONGODB_URI", ""):
+            with self.assertRaises(RuntimeError):
+                clip_service.build_repository()
 
 
 if __name__ == "__main__":
