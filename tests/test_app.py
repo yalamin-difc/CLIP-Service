@@ -141,6 +141,34 @@ class ClipServiceSecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["code"], "missing_identity")
 
+    def test_expired_service_identity_is_rejected(self):
+        claims = {
+            "iss": internal_auth.JWT_ISSUER,
+            "aud": internal_auth.JWT_AUDIENCE,
+            "service": "festival-backend",
+            "tenantId": "tenant-a",
+            "siteId": "site-1",
+            "siteIds": ["site-1"],
+            "actions": ["match:execute"],
+            "requestId": "req-expired",
+            "exp": int(time.time()) - 1,
+        }
+        token = internal_auth.sign_internal_token(claims, TEST_SECRET)
+        response = self.client.post(
+            "/match",
+            headers={"Authorization": f"Bearer {token}", "X-Request-Id": "req-expired"},
+            data={"text": "wallet"},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "identity_expired")
+
+    def test_identity_request_id_must_match_header(self):
+        headers = identity_headers(actions=["match:execute"], request_id="req-signed")
+        headers["X-Request-Id"] = "req-different"
+        response = self.client.post("/match", headers=headers, data={"text": "wallet"})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "request_id_mismatch")
+
     def test_action_permission_is_enforced(self):
         response = self.client.post(
             "/items",
