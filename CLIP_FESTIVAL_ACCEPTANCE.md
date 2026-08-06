@@ -54,7 +54,7 @@ MongoDB indexes and queries include tenant/site fields.
 
 ## OCR test results
 
-On Tesseract 5.3.4 with English and Arabic data, all 29 service tests pass,
+On Tesseract 5.3.4 with English and Arabic data, all 31 service tests pass,
 including actual-image English, Arabic, mixed Arabic-English, numeric identifier,
 and barcode extraction. Real OCR and barcode scans also pass through the HTTP
 execution and serialization paths. Timeout, disabled OCR, missing dependency,
