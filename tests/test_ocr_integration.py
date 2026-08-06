@@ -95,6 +95,30 @@ class OcrFailureIntegrationTests(unittest.TestCase):
             files={"file": ("ocr.png", self.actual_image, "image/png")},
         )
 
+    def analyze_bytes(self, payload, filename="image.png"):
+        return self.client.post(
+            "/analyze-image",
+            headers=identity_headers(actions=["match:execute"]),
+            files={"file": (filename, payload, "image/png")},
+        )
+
+    @unittest.skipUnless(ocr_dependency_ready("eng+ara"), "Tesseract English and Arabic data are required")
+    def test_http_path_executes_real_ocr(self):
+        response = self.analyze()
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["ocrError"])
+        self.assertIn("DUBAI", response.json()["ocr"]["fullText"].upper())
+
+    def test_http_path_extracts_real_barcode(self):
+        import zxingcpp
+
+        barcode = zxingcpp.create_barcode("DXB-HTTP-2026", zxingcpp.BarcodeFormat.Code128)
+        generated = zxingcpp.write_barcode_to_image(barcode, scale=4, add_hrt=True)
+        payload = png_bytes(Image.fromarray(np.asarray(generated)).convert("RGB"))
+        response = self.analyze_bytes(payload, "barcode.png")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("DXB-HTTP-2026", [entry["text"] for entry in response.json()["barcode"]["barcodes"]])
+
     def test_invalid_image(self):
         response = self.client.post(
             "/analyze-image",
