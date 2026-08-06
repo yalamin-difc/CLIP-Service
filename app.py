@@ -78,6 +78,8 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))
 MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "25000000"))
 REQUEST_CONCURRENCY = int(os.environ.get("REQUEST_CONCURRENCY", "32"))
 OCR_CONCURRENCY = int(os.environ.get("OCR_CONCURRENCY", "2"))
+INFERENCE_CONCURRENCY = int(os.environ.get("INFERENCE_CONCURRENCY", "1"))
+INFERENCE_TIMEOUT_MS = int(os.environ.get("INFERENCE_TIMEOUT_MS", "30000"))
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "120"))
 OCR_ENABLED = os.environ.get("OCR_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 OCR_LANGUAGES = os.environ.get("OCR_LANGUAGES", "eng+ara").strip() or "eng+ara"
@@ -89,6 +91,7 @@ EXPECTED_EMBEDDING_DIMENSION = int(os.environ.get("EXPECTED_EMBEDDING_DIMENSION"
 
 request_limiter = anyio.CapacityLimiter(max(1, REQUEST_CONCURRENCY))
 ocr_limiter = anyio.CapacityLimiter(max(1, OCR_CONCURRENCY))
+inference_limiter = anyio.CapacityLimiter(max(1, INFERENCE_CONCURRENCY))
 rate_limit_lock = threading.Lock()
 rate_limit_windows: Dict[str, tuple[int, int]] = {}
 
@@ -911,6 +914,38 @@ def warmup_model() -> None:
     model_warmup_completed = True
 
 
+async def run_image_embedding(image: Image.Image) -> List[float]:
+    try:
+        with anyio.fail_after(max(0.1, INFERENCE_TIMEOUT_MS / 1000.0)):
+            return await anyio.to_thread.run_sync(
+                image_embedding_for,
+                image,
+                limiter=inference_limiter,
+                abandon_on_cancel=True,
+            )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=problem_detail("inference_timeout", "Image inference timed out."),
+        ) from exc
+
+
+async def run_text_embedding(text: str) -> List[float]:
+    try:
+        with anyio.fail_after(max(0.1, INFERENCE_TIMEOUT_MS / 1000.0)):
+            return await anyio.to_thread.run_sync(
+                text_embedding_for,
+                text,
+                limiter=inference_limiter,
+                abandon_on_cancel=True,
+            )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=problem_detail("inference_timeout", "Text inference timed out."),
+        ) from exc
+
+
 async def run_ocr(image: Image.Image, lang: str, psm: int) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not OCR_ENABLED:
         return None, "OCR is disabled by service configuration."
@@ -1722,7 +1757,7 @@ async def encode_image(
     if upload is None:
         raise HTTPException(status_code=400, detail=problem_detail("missing_image", "No image uploaded. Use form field 'file' or 'image'."))
     _, pil_image = await read_image_upload(upload, "file")
-    encoded = image_embedding_for(pil_image)
+    encoded = await run_image_embedding(pil_image)
     response = with_request_id(
         request,
         {
@@ -1749,7 +1784,7 @@ async def encode_text(
     value = compact_text(text or queryText, limit=2000)
     if not value:
         raise HTTPException(status_code=400, detail=problem_detail("missing_text", "No text provided. Use form field 'text' or 'queryText'."))
-    encoded = text_embedding_for(value)
+    encoded = await run_text_embedding(value)
     response = with_request_id(
         request,
         {
@@ -1784,8 +1819,8 @@ async def similarity(
         )
     _, image_1 = await read_image_upload(upload_1, "file1")
     _, image_2 = await read_image_upload(upload_2, "file2")
-    embedding_1 = normalize_vectors(image_embedding_for(image_1))[0]
-    embedding_2 = normalize_vectors(image_embedding_for(image_2))[0]
+    embedding_1 = normalize_vectors(await run_image_embedding(image_1))[0]
+    embedding_2 = normalize_vectors(await run_image_embedding(image_2))[0]
     response = with_request_id(request, {"similarity": float(np.dot(embedding_1, embedding_2))})
     record_latency_metric(endpoint, started)
     record_request_metric(endpoint, 200)
@@ -1865,7 +1900,7 @@ async def analyze_image(
             "model": {
                 "modelId": MODEL_NAME,
                 "modelRevision": MODEL_REVISION,
-                "embeddingDimension": len(image_embedding_for(pil_image)),
+                "embeddingDimension": len(await run_image_embedding(pil_image)),
                 "device": INFERENCE_DEVICE,
             },
             "ocr": ocr_payload,
@@ -1894,7 +1929,7 @@ async def upsert_item(request: Request):
 
     if upload is not None:
         _, pil_image = await read_image_upload(upload, "file")
-        stored_item["embedding"] = image_embedding_for(pil_image)
+        stored_item["embedding"] = await run_image_embedding(pil_image)
         stored_item["clipEmbedding"] = stored_item["embedding"]
         stored_item["embeddingDimension"] = len(stored_item["embedding"])
         stored_item["image"] = image_info(pil_image, upload)
@@ -1995,7 +2030,7 @@ async def reembed_item(request: Request, item_id: str, file: UploadFile = File(.
     if existing is None:
         raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
     _, image = await read_image_upload(file, "file")
-    existing["embedding"] = image_embedding_for(image)
+    existing["embedding"] = await run_image_embedding(image)
     existing["clipEmbedding"] = existing["embedding"]
     existing["embeddingDimension"] = len(existing["embedding"])
     existing["modelId"] = MODEL_NAME
@@ -2050,7 +2085,7 @@ async def match(request: Request):
 
     if upload is not None:
         raw_bytes, pil_image = await read_image_upload(upload, "file")
-        query_embeddings.append(image_embedding_for(pil_image))
+        query_embeddings.append(await run_image_embedding(pil_image))
         query_image_info = image_info(pil_image, upload)
         if parsed_request.doOcr:
             query_ocr_payload, query_ocr_error = await run_ocr(pil_image, parsed_request.ocrLang, parsed_request.ocrPsm)
@@ -2058,7 +2093,7 @@ async def match(request: Request):
             query_barcode_payload, query_barcode_error = await run_barcode_scan(pil_image)
 
     if parsed_request.text:
-        query_embeddings.append(text_embedding_for(parsed_request.text))
+        query_embeddings.append(await run_text_embedding(parsed_request.text))
 
     query_vector = normalize_vectors(np.mean(np.asarray(query_embeddings, dtype=float), axis=0))[0]
     scanned_barcodes = normalize_barcodes((query_barcode_payload or {}).get("barcodes"))

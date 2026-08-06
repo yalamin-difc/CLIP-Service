@@ -270,6 +270,22 @@ class ClipServiceSecurityTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 413)
 
+    def test_inference_timeout_does_not_block_async_route(self):
+        def slow_embedding(image):
+            time.sleep(0.2)
+            return [1.0, 0.0, 0.0]
+
+        with patch.object(clip_service, "image_embedding_for", slow_embedding), patch.object(
+            clip_service, "INFERENCE_TIMEOUT_MS", 20
+        ):
+            response = self.client.post(
+                "/encode-image",
+                headers=identity_headers(actions=["match:execute"]),
+                files={"file": ("image.png", make_image_bytes(), "image/png")},
+            )
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.json()["error"]["code"], "inference_timeout")
+
     def test_embedding_validation_rejects_nonfinite_and_dimension_mismatch(self):
         with self.assertRaises(Exception):
             clip_service.validate_stored_embedding([float("nan"), 0, 1])

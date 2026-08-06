@@ -26,7 +26,9 @@ trusted backend; CORS is not an authentication control.
 
 Uploads enforce MIME allowlisting, byte and decoded-pixel limits, decoding
 validation, and decompression-bomb handling. Request/OCR concurrency, rate,
-request timeout, and OCR timeout are bounded by environment configuration.
+inference concurrency, request timeout, inference timeout, and OCR timeout are
+bounded by environment configuration. CLIP inference runs in a bounded worker
+thread so model execution cannot block the FastAPI event loop.
 Metrics and detailed health require signed operational identities.
 
 ## Deployment requirements
