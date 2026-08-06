@@ -22,6 +22,11 @@ docker build -f Dockerfile.cpu -t clip-service:festival-cpu .
 docker build -f Dockerfile.gpu -t clip-service:festival-gpu .
 ```
 
+Base image manifests are immutable:
+
+- Python CPU base: `sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7`
+- NVIDIA CUDA base: `sha256:2fcc4280646484290cc50dce5e65f388dd04352b07cbe89a635703bd1f9aedb6`
+
 The machine-readable CycloneDX SBOM is `sbom.cdx.json`. Regenerate it after every
 dependency change:
 

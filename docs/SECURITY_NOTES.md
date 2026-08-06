@@ -41,5 +41,5 @@ and all service traffic.
 HS256 uses a shared secret; workload identity or asymmetric JWT verification is
 preferred when the showcase platform supplies it. Rate limiting is process-local,
 so the gateway must provide distributed enforcement for multi-replica deployments.
-Container tags are pinned to patch releases but should be converted to
-registry-specific immutable digests during deployment promotion.
+Container bases are pinned to immutable multi-platform manifest digests; deployment
+promotion should additionally verify the selected platform digest and signature.

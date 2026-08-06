@@ -1,69 +1,41 @@
-## Deploy CLIP-Service to a Google GPU VM (safe, repeatable)
- 
-### Endpoints used by backend
-- `GET /health`
-- `POST /encode-image` (multipart: `file` or `image`)
-- `POST /encode-text` (multipart: `text` or `queryText`)
-- `POST /analyze-image` (multipart: `file` or `image`)
-- `GET /metrics` (protected in production)
- 
-### Pull updates on the GPU VM
-```bash
-ssh <user>@<vm-ip>
-cd ~/CLIP-Service
-git fetch origin
-git checkout cursor/items-endpoints-review-f8df
-git pull origin cursor/items-endpoints-review-f8df
-```
+# Deploy CLIP-Service on an NVIDIA VM
 
-Install dependencies (venv recommended)
+Build the pinned CUDA target:
 
 ```bash
-cd ~/CLIP-Service
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip wheel
-pip install -r requirements.txt
+docker build -f Dockerfile.gpu -t clip-service:festival-gpu .
 ```
 
-Run (defaults to 8000)
+Required runtime configuration:
 
 ```bash
-export PORT=8000
-bash scripts/start.sh
+ENV=festival
+STORAGE_MODE=mongodb
+MONGODB_URI='mongodb+srv://...'
+INTERNAL_JWT_SECRET='<at-least-32-random-bytes>'
+INFERENCE_DEVICE=cuda
+OCR_ENABLED=true
+OCR_LANGUAGES=eng+ara
 ```
 
-Health check:
+Run with an NVIDIA container runtime and inject secrets from the platform secret
+manager:
 
 ```bash
-curl -i http://127.0.0.1:8000/health
+docker run --rm --gpus all --env-file /secure/clip-service.env \
+  -p 8080:8080 clip-service:festival-gpu
 ```
 
-Run as a service (systemd)
-Create /etc/systemd/system/clip.service:
-
-```ini
-[Unit]
-Description=CLIP Service
-After=network.target
- 
-[Service]
-User=ubuntu
-WorkingDirectory=/home/ubuntu/CLIP-Service
-Environment="PORT=8000"
-ExecStart=/home/ubuntu/CLIP-Service/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
-Restart=always
-RestartSec=2
- 
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable/restart:
+Public probes:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable clip
-sudo systemctl restart clip
-sudo systemctl status clip --no-pager
+curl --fail http://127.0.0.1:8080/health/live
+curl --fail http://127.0.0.1:8080/health/ready
 ```
+
+Detailed health and metrics require signed internal JWTs carrying `health:read`
+or `metrics:read`. Readiness remains false until MongoDB, OCR, model loading, the
+512-dimensional embedding contract, explicit CUDA execution, and model warmup are
+all verified. Startup fails rather than falling back to CPU or in-memory storage.
+
+Operational and rollback requirements are in `CLIP_FESTIVAL_ACCEPTANCE.md`.
