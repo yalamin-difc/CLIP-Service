@@ -262,6 +262,14 @@ class MatchItemModel(StrictBaseModel):
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
     releasedAt: Optional[str] = None
+    tenantId: str
+    siteId: str
+    datasetVersion: str
+    demoData: bool
+    createdBy: str
+    modelId: str
+    modelRevision: str
+    embeddingDimension: int
 
 
 class MatchCandidateModel(StrictBaseModel):
