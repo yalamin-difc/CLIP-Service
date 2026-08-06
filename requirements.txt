@@ -2,6 +2,11 @@
 fastapi
 uvicorn
 pillow
+httpx
+pytesseract
+zxing-cpp
+prometheus-client
+transformers
 
 # CPU versions (Cloud Run friendly)
 # NOTE: transformers now requires torch>=2.6 for safe torch.load behavior.
