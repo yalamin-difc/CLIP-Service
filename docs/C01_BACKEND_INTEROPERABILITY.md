@@ -65,3 +65,11 @@ The flow verifies:
 CLIP-Service contract behavior is proven locally. Overall C-01 status is
 **PARTIALLY RESOLVED** until the updated Backend repository is made accessible and
 its actual adapter is run against this hardened service flow.
+
+## Validation results
+
+- Focused C-01 suite: 3 tests passed.
+- Complete CLIP-Service suite: 34 tests passed.
+- Service source changes for C-01: none.
+- Raw embeddings remain protected.
+- Signed internal JWT authentication remains mandatory.
