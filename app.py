@@ -215,6 +215,9 @@ class MatchGovernanceModel(StrictBaseModel):
 class MatchExplanationSimilarityModel(StrictBaseModel):
     cosine: float
     band: str
+    combinedCosine: float
+    imageCosine: Optional[float] = None
+    textCosine: Optional[float] = None
 
 
 class MatchExplanationOverlapModel(StrictBaseModel):
@@ -1007,7 +1010,15 @@ def should_return_no_match(top_score: float, second_score: Optional[float], min_
     }
 
 
-def match_explanation(item: Mapping[str, Any], query_ocr_text: Optional[str], query_barcodes: List[Dict[str, Any]], query_labels: List[str], score: float) -> Dict[str, Any]:
+def match_explanation(
+    item: Mapping[str, Any],
+    query_ocr_text: Optional[str],
+    query_barcodes: List[Dict[str, Any]],
+    query_labels: List[str],
+    score: float,
+    image_cosine: Optional[float] = None,
+    text_cosine: Optional[float] = None,
+) -> Dict[str, Any]:
     item_barcodes = normalize_barcodes(item.get("barcodes") or item.get("barcodeValues"))
     barcode_overlap = barcode_overlap_values(query_barcodes, item_barcodes)
 
@@ -1034,12 +1045,21 @@ def match_explanation(item: Mapping[str, Any], query_ocr_text: Optional[str], qu
         reasons.append("visual similarity")
     similarity_band = "high" if score >= 0.85 else "medium" if score >= 0.65 else "low"
     reason = ", ".join(reasons)
+    similarity: Dict[str, Any] = {
+        "cosine": round(float(score), 6),
+        "band": similarity_band,
+        "combinedCosine": round(float(score), 6),
+    }
+    if image_cosine is not None:
+        similarity["imageCosine"] = round(float(image_cosine), 6)
+    if text_cosine is not None:
+        similarity["textCosine"] = round(float(text_cosine), 6)
     return {
         "reason": reason,
         "summary": reason,
         "signals": signals,
         "scoreBand": similarity_band,
-        "similarity": {"cosine": round(float(score), 6), "band": similarity_band},
+        "similarity": similarity,
         "ocr": {"matchedTerms": ocr_overlap, "matchCount": len(ocr_overlap)},
         "barcode": {"matchedValues": barcode_overlap, "matchCount": len(barcode_overlap)},
         "labels": {"matchedValues": label_overlap, "matchCount": len(label_overlap)},
@@ -2076,6 +2096,8 @@ async def match(request: Request):
         )
 
     query_embeddings: List[List[float]] = []
+    image_embedding: Optional[List[float]] = None
+    text_embedding: Optional[List[float]] = None
     query_image_info = None
     raw_bytes = None
     query_ocr_payload = None
@@ -2085,7 +2107,8 @@ async def match(request: Request):
 
     if upload is not None:
         raw_bytes, pil_image = await read_image_upload(upload, "file")
-        query_embeddings.append(await run_image_embedding(pil_image))
+        image_embedding = await run_image_embedding(pil_image)
+        query_embeddings.append(image_embedding)
         query_image_info = image_info(pil_image, upload)
         if parsed_request.doOcr:
             query_ocr_payload, query_ocr_error = await run_ocr(pil_image, parsed_request.ocrLang, parsed_request.ocrPsm)
@@ -2093,9 +2116,16 @@ async def match(request: Request):
             query_barcode_payload, query_barcode_error = await run_barcode_scan(pil_image)
 
     if parsed_request.text:
-        query_embeddings.append(await run_text_embedding(parsed_request.text))
+        text_embedding = await run_text_embedding(parsed_request.text)
+        query_embeddings.append(text_embedding)
 
     query_vector = normalize_vectors(np.mean(np.asarray(query_embeddings, dtype=float), axis=0))[0]
+    # Separate per-modality vectors so each candidate's explanation can report
+    # imageCosine/textCosine individually, alongside the combined retrieval
+    # score used for ranking (combinedCosine). Raw vectors are never exposed —
+    # only the resulting scalar cosine values are attached to the response.
+    image_query_vector = normalize_vectors(image_embedding)[0] if image_embedding is not None else None
+    text_query_vector = normalize_vectors(text_embedding)[0] if text_embedding is not None else None
     scanned_barcodes = normalize_barcodes((query_barcode_payload or {}).get("barcodes"))
     combined_barcodes = merge_barcodes(normalize_barcodes(parsed_request.barcodeValues), scanned_barcodes)
     query_barcode_values = barcode_values(combined_barcodes)
@@ -2112,7 +2142,7 @@ async def match(request: Request):
             continue
         candidate_vector = normalize_vectors(candidate["embedding"])[0]
         score = float(np.dot(query_vector, candidate_vector))
-        ranked.append({"candidate": candidate, "score": score})
+        ranked.append({"candidate": candidate, "score": score, "vector": candidate_vector})
 
     ranked.sort(key=lambda row: row["score"], reverse=True)
     top_rows = ranked[: parsed_request.topK]
@@ -2127,20 +2157,38 @@ async def match(request: Request):
         parsed_request.thresholds.minMargin,
     )
 
+    # CLIP's no-match decision is advisory only (see decision below) — it does
+    # not gate which candidates are returned. Ranked, authorized, released
+    # retrieval candidates are always returned in topK so a trusted Backend
+    # consumer can evaluate them with its own multimodal fusion (OCR,
+    # barcode, location, time, category, evidence quality) even when CLIP's
+    # own image-similarity gate alone would have said "no match". A returned
+    # candidate is retrieval evidence, not an accepted match — the caller
+    # decides acceptance.
     results: List[Dict[str, Any]] = []
-    if not no_match:
-        for row, confidence in zip(top_rows, confidences):
-            candidate = row["candidate"]
-            score = row["score"]
-            results.append(
-                {
-                    "candidateId": candidate["id"],
-                    "item": serialize_item(candidate, include_embedding=False),
-                    "score": round(score, 6),
-                    "confidence": round(float(confidence), 6),
-                    "explanation": match_explanation(candidate, query_ocr_text, combined_barcodes, parsed_request.labels, score),
-                }
-            )
+    for row, confidence in zip(top_rows, confidences):
+        candidate = row["candidate"]
+        candidate_vector = row["vector"]
+        score = row["score"]
+        image_cosine = float(np.dot(image_query_vector, candidate_vector)) if image_query_vector is not None else None
+        text_cosine = float(np.dot(text_query_vector, candidate_vector)) if text_query_vector is not None else None
+        results.append(
+            {
+                "candidateId": candidate["id"],
+                "item": serialize_item(candidate, include_embedding=False),
+                "score": round(score, 6),
+                "confidence": round(float(confidence), 6),
+                "explanation": match_explanation(
+                    candidate,
+                    query_ocr_text,
+                    combined_barcodes,
+                    parsed_request.labels,
+                    score,
+                    image_cosine=image_cosine,
+                    text_cosine=text_cosine,
+                ),
+            }
+        )
 
     get_repository().add_audit_log(
         "match_execution",
