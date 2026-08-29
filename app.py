@@ -260,8 +260,10 @@ class MatchItemModel(StrictBaseModel):
     ocrText: Optional[str] = None
     ocr: Optional[Dict[str, Any]] = None
     ocrWords: List[Dict[str, Any]] = Field(default_factory=list)
+    ocrProvenance: Optional[Dict[str, Any]] = None
     barcodes: List[Dict[str, Any]] = Field(default_factory=list)
     barcodeValues: List[str] = Field(default_factory=list)
+    barcodeProvenance: Optional[Dict[str, Any]] = None
     labels: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     image: Optional[Dict[str, Any]] = None
@@ -972,12 +974,90 @@ async def run_barcode_scan(image: Image.Image) -> tuple[Optional[Dict[str, Any]]
         return None, "Barcode service is not available."
     try:
         with anyio.fail_after(max(0.1, float(BARCODE_TIMEOUT_MS) / 1000.0)):
-            result = await anyio.to_thread.run_sync(_scan_barcodes, image)
+            # abandon_on_cancel=True is required for fail_after's timeout to
+            # actually take effect here -- without it, anyio defers
+            # cancellation until the worker thread returns on its own,
+            # which defeats BARCODE_TIMEOUT_MS entirely for a scan that
+            # hangs or runs long (F-03).
+            result = await anyio.to_thread.run_sync(_scan_barcodes, image, abandon_on_cancel=True)
         return result, None
     except TimeoutError:
         return None, "Barcode scan timed out."
     except Exception as exc:  # pragma: no cover - depends on optional runtime tools
         return None, str(exc)
+
+
+def signal_provenance(source: str, *, error: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Provenance record attached to a corpus item's OCR/barcode signals
+    (F-03). `source` is one of:
+      - "manual": the caller supplied this request's ocr/ocrText/barcodes/
+        barcodeValues fields explicitly -- treated as an authoritative
+        override and automatic analysis is skipped for that signal.
+      - "auto": this service ran OCR/barcode analysis itself against the
+        uploaded image (the default whenever no manual value was supplied
+        for that signal on this request).
+      - "unavailable": automatic analysis could not run at all (disabled
+        by config, or the optional runtime dependency isn't installed).
+    `error` carries a non-fatal analysis failure (timeout, engine error) --
+    the corpus item is still stored either way; OCR/barcode failure must
+    never block ingestion, only degrade the signal's availability.
+    """
+    record: Dict[str, Any] = {
+        "source": source,
+        "analyzedAt": now_iso(),
+        "serviceVersion": SERVICE_VERSION,
+        "error": error,
+    }
+    if extra:
+        record.update(extra)
+    return record
+
+
+async def apply_candidate_signals(stored_item: Dict[str, Any], pil_image: Image.Image, *, manual_ocr: bool, manual_barcode: bool) -> None:
+    """
+    Populates stored_item's OCR/barcode fields plus provenance for a
+    corpus item's uploaded image (F-03), applied identically by both
+    POST /items (initial ingestion / re-registration) and
+    POST /items/{id}/re-embed (explicit reprocess). A manual signal
+    supplied on this same request always wins over fresh analysis --
+    see signal_provenance's docstring for the full precedence policy.
+    Analysis failure (disabled, missing dependency, timeout, engine
+    error) degrades to an empty/absent signal with the reason recorded
+    in provenance; it never raises and never blocks storing the item.
+    """
+    if manual_ocr:
+        stored_item["ocrProvenance"] = signal_provenance("manual")
+    else:
+        ocr_result, ocr_error = await run_ocr(pil_image, OCR_LANGUAGES, OCR_PSM)
+        ocr_extra = {"engine": "tesseract", "lang": OCR_LANGUAGES, "psm": OCR_PSM}
+        if ocr_result is not None:
+            stored_item["ocrText"] = ocr_result.get("fullText") or None
+            stored_item["ocrWords"] = ocr_result.get("words") or []
+            stored_item["ocr"] = ocr_result
+            stored_item["ocrProvenance"] = signal_provenance("auto", extra=ocr_extra)
+        else:
+            stored_item["ocrText"] = None
+            stored_item["ocrWords"] = []
+            stored_item["ocr"] = None
+            source = "unavailable" if (not OCR_ENABLED or _extract_ocr is None) else "auto"
+            stored_item["ocrProvenance"] = signal_provenance(source, error=ocr_error, extra=ocr_extra)
+
+    if manual_barcode:
+        stored_item["barcodeProvenance"] = signal_provenance("manual")
+    else:
+        barcode_result, barcode_error = await run_barcode_scan(pil_image)
+        barcode_extra = {"engine": "zxing-cpp"}
+        if barcode_result is not None:
+            barcodes = normalize_barcodes(barcode_result.get("barcodes"))
+            stored_item["barcodes"] = barcodes
+            stored_item["barcodeValues"] = barcode_values(barcodes)
+            stored_item["barcodeProvenance"] = signal_provenance("auto", extra=barcode_extra)
+        else:
+            stored_item["barcodes"] = []
+            stored_item["barcodeValues"] = []
+            source = "unavailable" if _scan_barcodes is None else "auto"
+            stored_item["barcodeProvenance"] = signal_provenance(source, error=barcode_error, extra=barcode_extra)
 
 
 def softmax_confidences(scores: List[float], temperature: float = 0.07) -> List[float]:
@@ -1401,8 +1481,10 @@ def serialize_item(item: Mapping[str, Any], include_embedding: bool = False) -> 
         "ocrText": item.get("ocrText"),
         "ocr": item.get("ocr"),
         "ocrWords": item.get("ocrWords"),
+        "ocrProvenance": item.get("ocrProvenance"),
         "barcodes": item.get("barcodes") or [],
         "barcodeValues": item.get("barcodeValues") or [],
+        "barcodeProvenance": item.get("barcodeProvenance"),
         "labels": item.get("labels") or [],
         "metadata": item.get("metadata") or {},
         "image": item.get("image"),
@@ -1944,8 +2026,23 @@ async def upsert_item(request: Request):
     upload = parsed_payload.pop("upload", None)
     normalized_patch = parse_item_payload(parsed_payload)
 
+    # F-03: captured before prepare_item_for_storage merges/defaults these
+    # keys onto stored_item -- normalized_patch only contains what this
+    # specific request actually supplied, which is what the manual-vs-auto
+    # precedence decision in apply_candidate_signals must be based on.
+    manual_ocr_supplied = "ocrText" in normalized_patch or "ocr" in normalized_patch
+    manual_barcode_supplied = "barcodes" in normalized_patch or "barcodeValues" in normalized_patch
+
     existing = get_repository().get_item(normalized_patch["id"], identity)
     stored_item = prepare_item_for_storage(existing, normalized_patch, identity)
+    # A manual signal is provenance-tagged as soon as it's supplied, even
+    # without an image in the same request (e.g. a metadata-only correction
+    # to previously stored OCR text) -- automatic re-analysis below only
+    # ever runs for the signal(s) this request did NOT supply manually.
+    if manual_ocr_supplied:
+        stored_item["ocrProvenance"] = signal_provenance("manual")
+    if manual_barcode_supplied:
+        stored_item["barcodeProvenance"] = signal_provenance("manual")
 
     if upload is not None:
         _, pil_image = await read_image_upload(upload, "file")
@@ -1955,6 +2052,14 @@ async def upsert_item(request: Request):
         stored_item["image"] = image_info(pil_image, upload)
         stored_item["eligibleForMatching"] = bool(stored_item.get("released")) and True
         stored_item["status"] = "released" if stored_item["eligibleForMatching"] else "stored"
+        # A freshly uploaded image supersedes whatever candidate signals an
+        # earlier version of this item carried -- analyze (or apply this
+        # request's manual override for) the image actually being stored,
+        # every time, rather than leaving a prior image's stale OCR/barcode
+        # data attached to a new photo.
+        await apply_candidate_signals(
+            stored_item, pil_image, manual_ocr=manual_ocr_supplied, manual_barcode=manual_barcode_supplied
+        )
 
     saved_item = get_repository().upsert_item(stored_item)
     get_repository().add_audit_log(
@@ -2056,10 +2161,22 @@ async def reembed_item(request: Request, item_id: str, file: UploadFile = File(.
     existing["modelId"] = MODEL_NAME
     existing["modelRevision"] = MODEL_REVISION
     existing["updatedAt"] = now_iso()
+    # F-03: re-embed always means a new photo, so its OCR/barcode signals
+    # are reprocessed from that image every time -- there is no separate
+    # manual-override channel on this endpoint (just the file), and this
+    # is a pure function of (image, config): calling it again with the
+    # same image reliably reproduces the same signals/provenance, making
+    # reprocessing explicit and idempotent rather than a one-time side effect.
+    await apply_candidate_signals(existing, image, manual_ocr=False, manual_barcode=False)
     saved = get_repository().upsert_item(existing)
     get_repository().add_audit_log(
         "re_embedding",
-        {"modelId": MODEL_NAME, "modelRevision": MODEL_REVISION},
+        {
+            "modelId": MODEL_NAME,
+            "modelRevision": MODEL_REVISION,
+            "ocrProvenance": existing.get("ocrProvenance"),
+            "barcodeProvenance": existing.get("barcodeProvenance"),
+        },
         item_id=item_id,
         request_id=get_request_id(request),
         tenant_id=identity.tenant_id,
