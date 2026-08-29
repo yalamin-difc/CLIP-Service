@@ -243,6 +243,7 @@ class MatchExplanationModel(StrictBaseModel):
     scoreBand: str
     signals: Dict[str, Any] = Field(default_factory=dict)
     similarity: MatchExplanationSimilarityModel
+    candidateEmbeddingModality: Optional[str] = None
     ocr: MatchExplanationOverlapModel
     barcode: MatchExplanationValueMatchModel
     labels: MatchExplanationValueMatchModel
@@ -278,6 +279,7 @@ class MatchItemModel(StrictBaseModel):
     modelId: str
     modelRevision: str
     embeddingDimension: int
+    embeddingModality: Optional[str] = None
 
 
 class MatchCandidateModel(StrictBaseModel):
@@ -1099,6 +1101,14 @@ def match_explanation(
     image_cosine: Optional[float] = None,
     text_cosine: Optional[float] = None,
 ) -> Dict[str, Any]:
+    # F-07: a candidate registered without an image (a lost report with no
+    # photo, see upsert_item) carries a text-derived embedding instead --
+    # "visual similarity" would misrepresent what the score actually
+    # measures for it. Surfacing embeddingModality lets a caller (Backend's
+    # own fusion) calibrate/explain such a match distinctly rather than
+    # silently treating it exactly like an image-backed one, or reading
+    # "no image evidence" as a negative signal instead of "not applicable".
+    candidate_embedding_modality = item.get("embeddingModality") or ("image" if item.get("image") else None)
     item_barcodes = normalize_barcodes(item.get("barcodes") or item.get("barcodeValues"))
     barcode_overlap = barcode_overlap_values(query_barcodes, item_barcodes)
 
@@ -1122,7 +1132,9 @@ def match_explanation(
         signals["labels"] = label_overlap
         reasons.append("shared labels")
     if not reasons:
-        reasons.append("visual similarity")
+        reasons.append(
+            "visual similarity" if candidate_embedding_modality != "text" else "text similarity (no image evidence available)"
+        )
     similarity_band = "high" if score >= 0.85 else "medium" if score >= 0.65 else "low"
     reason = ", ".join(reasons)
     similarity: Dict[str, Any] = {
@@ -1140,6 +1152,7 @@ def match_explanation(
         "signals": signals,
         "scoreBand": similarity_band,
         "similarity": similarity,
+        "candidateEmbeddingModality": candidate_embedding_modality,
         "ocr": {"matchedTerms": ocr_overlap, "matchCount": len(ocr_overlap)},
         "barcode": {"matchedValues": barcode_overlap, "matchCount": len(barcode_overlap)},
         "labels": {"matchedValues": label_overlap, "matchCount": len(label_overlap)},
@@ -1499,6 +1512,7 @@ def serialize_item(item: Mapping[str, Any], include_embedding: bool = False) -> 
         "modelId": item.get("modelId"),
         "modelRevision": item.get("modelRevision"),
         "embeddingDimension": item.get("embeddingDimension"),
+        "embeddingModality": item.get("embeddingModality"),
     }
     return payload
 
@@ -1523,6 +1537,7 @@ def parse_item_payload(raw_payload: Mapping[str, Any]) -> Dict[str, Any]:
         "modelId",
         "modelRevision",
         "embeddingDimension",
+        "embeddingModality",
     }
     supplied_forbidden = sorted(forbidden.intersection(payload))
     if supplied_forbidden:
@@ -2049,6 +2064,7 @@ async def upsert_item(request: Request):
         stored_item["embedding"] = await run_image_embedding(pil_image)
         stored_item["clipEmbedding"] = stored_item["embedding"]
         stored_item["embeddingDimension"] = len(stored_item["embedding"])
+        stored_item["embeddingModality"] = "image"
         stored_item["image"] = image_info(pil_image, upload)
         stored_item["eligibleForMatching"] = bool(stored_item.get("released")) and True
         stored_item["status"] = "released" if stored_item["eligibleForMatching"] else "stored"
@@ -2060,6 +2076,29 @@ async def upsert_item(request: Request):
         await apply_candidate_signals(
             stored_item, pil_image, manual_ocr=manual_ocr_supplied, manual_barcode=manual_barcode_supplied
         )
+    elif stored_item.get("embedding") is None:
+        # F-07: a lost report may legitimately have no photo (the frontend
+        # allows this, requiring a longer description instead) -- without
+        # this branch such an item never gets ANY embedding and can never
+        # become eligible for matching, regardless of its released state.
+        # CLIP's contrastive training puts text and image embeddings in
+        # the same joint space, so a text embedding is directly comparable
+        # (plain dot product, same as /match already does for every
+        # candidate) to an image OR text query -- a real corpus signal,
+        # not a placeholder. embeddingModality lets callers (Backend's own
+        # fusion, match_explanation below) tell a text-only candidate
+        # apart from an image-backed one instead of treating both alike.
+        text_source = compact_text(
+            " ".join(part for part in [stored_item.get("title"), stored_item.get("description")] if part),
+            limit=1000,
+        )
+        if text_source:
+            stored_item["embedding"] = await run_text_embedding(text_source)
+            stored_item["clipEmbedding"] = stored_item["embedding"]
+            stored_item["embeddingDimension"] = len(stored_item["embedding"])
+            stored_item["embeddingModality"] = "text"
+            stored_item["eligibleForMatching"] = bool(stored_item.get("released")) and True
+            stored_item["status"] = "released" if stored_item["eligibleForMatching"] else "stored"
 
     saved_item = get_repository().upsert_item(stored_item)
     get_repository().add_audit_log(
