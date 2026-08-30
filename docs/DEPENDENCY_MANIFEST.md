@@ -5,8 +5,9 @@ Runtime Python dependencies are fully version-pinned in:
 - `requirements.txt` for CPU/PyTorch CPU wheels;
 - `requirements-gpu.txt` for CUDA 12.4-compatible PyTorch wheels.
 
-The OpenAI CLIP source dependency is pinned to commit
-`d05afc436d78f1c48dc0dbf8e5980a9d471f35f6`.
+CLIP inference uses the Hugging Face `transformers` implementation exclusively
+(see `app.py`); there is no dependency on the standalone `openai/CLIP` GitHub
+source, `sentence-transformers`, or `scikit-learn`.
 
 System dependencies in both images:
 

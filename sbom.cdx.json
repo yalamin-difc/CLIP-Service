@@ -21,28 +21,8 @@
       "version": "0.141.1"
     },
     {
-      "bom-ref": "requirements-L20",
-      "description": "requirements line 20: ftfy==6.3.1",
-      "externalReferences": [
-        {
-          "comment": "implicit dist extra-url",
-          "type": "distribution",
-          "url": "https://download.pytorch.org/whl/cpu/ftfy/"
-        },
-        {
-          "comment": "implicit dist url",
-          "type": "distribution",
-          "url": "https://pypi.org/simple/ftfy/"
-        }
-      ],
-      "name": "ftfy",
-      "purl": "pkg:pypi/ftfy@6.3.1",
-      "type": "library",
-      "version": "6.3.1"
-    },
-    {
-      "bom-ref": "requirements-L16",
-      "description": "requirements line 16: gunicorn==26.0.0",
+      "bom-ref": "requirements-L13",
+      "description": "requirements line 13: gunicorn==26.0.0",
       "externalReferences": [
         {
           "comment": "implicit dist extra-url",
@@ -81,8 +61,8 @@
       "version": "0.28.1"
     },
     {
-      "bom-ref": "requirements-L17",
-      "description": "requirements line 17: numpy==2.4.4",
+      "bom-ref": "requirements-L14",
+      "description": "requirements line 14: numpy==2.4.4",
       "externalReferences": [
         {
           "comment": "implicit dist extra-url",
@@ -141,8 +121,8 @@
       "version": "0.26.0"
     },
     {
-      "bom-ref": "requirements-L19",
-      "description": "requirements line 19: pymongo==4.17.0",
+      "bom-ref": "requirements-L15",
+      "description": "requirements line 15: pymongo==4.17.0",
       "externalReferences": [
         {
           "comment": "implicit dist extra-url",
@@ -181,8 +161,8 @@
       "version": "0.3.13"
     },
     {
-      "bom-ref": "requirements-L15",
-      "description": "requirements line 15: python-multipart==0.0.32",
+      "bom-ref": "requirements-L12",
+      "description": "requirements line 12: python-multipart==0.0.32",
       "externalReferences": [
         {
           "comment": "implicit dist extra-url",
@@ -201,8 +181,8 @@
       "version": "0.0.32"
     },
     {
-      "bom-ref": "requirements-L21",
-      "description": "requirements line 21: regex==2026.7.19",
+      "bom-ref": "requirements-L16",
+      "description": "requirements line 16: regex==2026.7.19",
       "externalReferences": [
         {
           "comment": "implicit dist extra-url",
@@ -219,46 +199,6 @@
       "purl": "pkg:pypi/regex@2026.7.19",
       "type": "library",
       "version": "2026.7.19"
-    },
-    {
-      "bom-ref": "requirements-L18",
-      "description": "requirements line 18: scikit-learn==1.9.0",
-      "externalReferences": [
-        {
-          "comment": "implicit dist extra-url",
-          "type": "distribution",
-          "url": "https://download.pytorch.org/whl/cpu/scikit-learn/"
-        },
-        {
-          "comment": "implicit dist url",
-          "type": "distribution",
-          "url": "https://pypi.org/simple/scikit-learn/"
-        }
-      ],
-      "name": "scikit-learn",
-      "purl": "pkg:pypi/scikit-learn@1.9.0",
-      "type": "library",
-      "version": "1.9.0"
-    },
-    {
-      "bom-ref": "requirements-L14",
-      "description": "requirements line 14: sentence-transformers==5.7.0",
-      "externalReferences": [
-        {
-          "comment": "implicit dist extra-url",
-          "type": "distribution",
-          "url": "https://download.pytorch.org/whl/cpu/sentence-transformers/"
-        },
-        {
-          "comment": "implicit dist url",
-          "type": "distribution",
-          "url": "https://pypi.org/simple/sentence-transformers/"
-        }
-      ],
-      "name": "sentence-transformers",
-      "purl": "pkg:pypi/sentence-transformers@5.7.0",
-      "type": "library",
-      "version": "5.7.0"
     },
     {
       "bom-ref": "requirements-L11",
@@ -281,48 +221,8 @@
       "version": "2.6.0+cpu"
     },
     {
-      "bom-ref": "requirements-L13",
-      "description": "requirements line 13: torchaudio==2.6.0+cpu",
-      "externalReferences": [
-        {
-          "comment": "implicit dist extra-url",
-          "type": "distribution",
-          "url": "https://download.pytorch.org/whl/cpu/torchaudio/"
-        },
-        {
-          "comment": "implicit dist url",
-          "type": "distribution",
-          "url": "https://pypi.org/simple/torchaudio/"
-        }
-      ],
-      "name": "torchaudio",
-      "purl": "pkg:pypi/torchaudio@2.6.0%2Bcpu",
-      "type": "library",
-      "version": "2.6.0+cpu"
-    },
-    {
-      "bom-ref": "requirements-L12",
-      "description": "requirements line 12: torchvision==0.21.0+cpu",
-      "externalReferences": [
-        {
-          "comment": "implicit dist extra-url",
-          "type": "distribution",
-          "url": "https://download.pytorch.org/whl/cpu/torchvision/"
-        },
-        {
-          "comment": "implicit dist url",
-          "type": "distribution",
-          "url": "https://pypi.org/simple/torchvision/"
-        }
-      ],
-      "name": "torchvision",
-      "purl": "pkg:pypi/torchvision@0.21.0%2Bcpu",
-      "type": "library",
-      "version": "0.21.0+cpu"
-    },
-    {
-      "bom-ref": "requirements-L22",
-      "description": "requirements line 22: tqdm==4.70.0",
+      "bom-ref": "requirements-L17",
+      "description": "requirements line 17: tqdm==4.70.0",
       "externalReferences": [
         {
           "comment": "implicit dist extra-url",
@@ -359,19 +259,6 @@
       "purl": "pkg:pypi/transformers@5.14.1",
       "type": "library",
       "version": "5.14.1"
-    },
-    {
-      "bom-ref": "requirements-L23",
-      "description": "requirements line 23: git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6",
-      "externalReferences": [
-        {
-          "comment": "explicit dist url",
-          "type": "vcs",
-          "url": "git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6"
-        }
-      ],
-      "name": "unknown",
-      "type": "library"
     },
     {
       "bom-ref": "requirements-L4",
@@ -440,24 +327,6 @@
       "ref": "requirements-L17"
     },
     {
-      "ref": "requirements-L18"
-    },
-    {
-      "ref": "requirements-L19"
-    },
-    {
-      "ref": "requirements-L20"
-    },
-    {
-      "ref": "requirements-L21"
-    },
-    {
-      "ref": "requirements-L22"
-    },
-    {
-      "ref": "requirements-L23"
-    },
-    {
       "ref": "requirements-L3"
     },
     {
@@ -480,7 +349,7 @@
     }
   ],
   "metadata": {
-    "timestamp": "2026-08-06T16:16:53.079176+00:00",
+    "timestamp": "2026-08-30T18:03:44.443358+00:00",
     "tools": {
       "components": [
         {
@@ -579,12 +448,12 @@
           ],
           "name": "cyclonedx-python-lib",
           "type": "library",
-          "version": "11.11.0"
+          "version": "11.12.0"
         }
       ]
     }
   },
-  "serialNumber": "urn:uuid:b1fed635-da8e-4377-ba58-7563c6b71215",
+  "serialNumber": "urn:uuid:67f35c54-d19e-45ad-93f1-395592138a89",
   "version": 1,
   "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
   "bomFormat": "CycloneDX",
