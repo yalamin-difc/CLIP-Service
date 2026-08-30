@@ -202,6 +202,16 @@ class MatchGovernanceModel(StrictBaseModel):
     engine: str = "clip"
     serviceVersion: str
     modelId: str
+    # P1-7: live runtime provenance (runtime_provenance()) -- modelRevision
+    # and embeddingDimension come from the actually loaded model/most
+    # recent real inference, not a hand-maintained constant.
+    # preprocessingVersion is Optional because it can genuinely be
+    # unavailable before the model has ever loaded (compute_preprocessing_version
+    # only ever runs inside load_model()); Backend must treat a null/absent
+    # value as "not yet knowable," never coerce it to a placeholder.
+    modelRevision: str
+    embeddingDimension: Optional[int] = None
+    preprocessingVersion: Optional[str] = None
     confidence: Dict[str, float]
     scoringVersion: str
     thresholds: ThresholdsModel
@@ -449,10 +459,16 @@ def request_latency_ms(request: Request) -> int:
 
 
 def governance_meta(**extra: Any) -> Dict[str, Any]:
+    # P1-7: every scored response carries the SAME live runtime provenance
+    # /health reports (runtime_provenance(), defined below -- resolved at
+    # call time, well after module load) -- modelId/modelRevision/
+    # embeddingDimension/preprocessingVersion/scoringVersion/serviceVersion
+    # all reflect the actual currently loaded model, not constants a
+    # caller has to trust were kept in sync by hand. Backend persists this
+    # exact block as authoritative MatchDecision provenance.
     payload: Dict[str, Any] = {
         "engine": "clip",
-        "serviceVersion": SERVICE_VERSION,
-        "modelId": MODEL_NAME,
+        **runtime_provenance(),
         "confidence": {
             "temperature": CONF_TEMPERATURE,
             "minScore": CONF_MIN_SCORE,
@@ -745,6 +761,48 @@ model_lock = threading.Lock()
 embedding_dimension: Optional[int] = None
 model_warmup_completed = False
 model_load_error: Optional[str] = None
+# P1-7: never a hand-maintained constant -- derived from the actually
+# loaded processor's own real config the moment it loads (see
+# compute_preprocessing_version below), so it changes automatically if
+# the real preprocessing pipeline ever does (a different revision, a
+# different image size/normalization), instead of silently drifting out
+# of sync with a constant nobody remembered to bump.
+preprocessing_version: Optional[str] = None
+
+
+def compute_preprocessing_version(processor_instance: Any) -> Optional[str]:
+    """
+    A short, deterministic fingerprint of the real, currently loaded
+    image preprocessing pipeline (resize target, resample method,
+    crop size, rescale factor, normalization mean/std) -- whatever the
+    processor's own config actually contains, not a value this service
+    guesses at or hardcodes. Two processor instances with identical
+    preprocessing behavior always produce the same fingerprint; any real
+    difference (a different model revision shipping a different resize
+    size, for example) changes it.
+    """
+    image_processor = getattr(processor_instance, "image_processor", None) or processor_instance
+    try:
+        config = image_processor.to_dict() if hasattr(image_processor, "to_dict") else vars(image_processor)
+    except Exception:  # pragma: no cover - defensive; a config dump should never fail
+        return None
+    relevant_keys = (
+        "size",
+        "crop_size",
+        "resample",
+        "do_resize",
+        "do_center_crop",
+        "do_rescale",
+        "rescale_factor",
+        "do_normalize",
+        "image_mean",
+        "image_std",
+    )
+    fingerprint_source = {key: config[key] for key in relevant_keys if key in config}
+    if not fingerprint_source:
+        return None
+    serialized = json.dumps(fingerprint_source, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
 def configured_device() -> str:
@@ -772,7 +830,7 @@ def _feature_tensor(value: Any) -> Any:
 
 
 def load_model():
-    global model, processor, model_load_error
+    global model, processor, model_load_error, preprocessing_version
     if model is None or processor is None:
         with model_lock:
             if model is None or processor is None:
@@ -792,12 +850,14 @@ def load_model():
                     if hasattr(model, "eval"):
                         model.eval()
                     model_load_error = None
+                    preprocessing_version = compute_preprocessing_version(processor)
                     logger.info(
                         json.dumps(
                             {
                                 "event": "model_load",
                                 "modelId": MODEL_NAME,
                                 "modelRevision": MODEL_REVISION,
+                                "preprocessingVersion": preprocessing_version,
                                 "device": device,
                             }
                         )
@@ -818,14 +878,36 @@ def load_model():
     return model, processor
 
 
-def model_health() -> Dict[str, Any]:
+def runtime_provenance() -> Dict[str, Any]:
+    """
+    P1-7: the single, shared shape of "what model actually produced this"
+    -- used both by /health's dependency report and by every scored
+    response (governance_meta below), so Backend can persist exactly
+    what a given response carries as authoritative MatchDecision
+    metadata, and compare it against its own separately-configured
+    expectation, without a second round-trip to /health that could race
+    the response it's meant to describe.
+    """
     return {
         "modelId": MODEL_NAME,
         "modelRevision": MODEL_REVISION,
-        "loaded": model is not None and processor is not None,
         "embeddingDimension": embedding_dimension,
+        "preprocessingVersion": preprocessing_version,
+        "scoringVersion": SCORING_VERSION,
+        "serviceVersion": SERVICE_VERSION,
+    }
+
+
+def model_health() -> Dict[str, Any]:
+    return {
+        **runtime_provenance(),
+        "loaded": model is not None and processor is not None,
         "device": INFERENCE_DEVICE,
         "warmupCompleted": model_warmup_completed,
+        "expectedEmbeddingDimension": EXPECTED_EMBEDDING_DIMENSION,
+        "embeddingDimensionMatchesExpected": embedding_dimension == EXPECTED_EMBEDDING_DIMENSION
+        if embedding_dimension is not None
+        else False,
     }
 
 
@@ -1830,13 +1912,30 @@ def health_ready(request: Request):
     checks = {
         "modelLoaded": model is not None and processor is not None,
         "embeddingDimensionKnown": isinstance(embedding_dimension, int) and embedding_dimension > 0,
+        # P1-7: "known" alone (any positive int) previously passed even
+        # when warm-up produced a dimension that doesn't match this
+        # deployment's configured expectation (EXPECTED_EMBEDDING_DIMENSION)
+        # -- a real, silent incompatibility (wrong model/revision loaded,
+        # or a config drift) that readiness must fail on, not just "the
+        # model ran once."
+        "embeddingDimensionMatchesExpected": embedding_dimension == EXPECTED_EMBEDDING_DIMENSION
+        if isinstance(embedding_dimension, int)
+        else False,
+        "preprocessingVersionKnown": preprocessing_version is not None,
         "ocrDependencyReady": (not OCR_ENABLED) or ocr_dependency_ready(OCR_LANGUAGES),
         "databaseReady": database_ready,
         "device": INFERENCE_DEVICE,
         "warmupCompleted": model_warmup_completed,
     }
     ready = all(value for key, value in checks.items() if key != "device")
-    payload = with_request_id(request, {"status": "ready" if ready else "not_ready", "checks": checks})
+    payload = with_request_id(
+        request,
+        {
+            "status": "ready" if ready else "not_ready",
+            "checks": checks,
+            "expectedEmbeddingDimension": EXPECTED_EMBEDDING_DIMENSION,
+        },
+    )
     return JSONResponse(status_code=200 if ready else 503, content=payload)
 
 
@@ -2395,7 +2494,6 @@ async def match(request: Request):
         {
             "governance": {
                 **governance_meta(),
-                "scoringVersion": SCORING_VERSION,
                 "thresholds": parsed_request.thresholds.model_dump(mode="json"),
                 "releasedOnly": parsed_request.status == "released",
                 "topKRequested": parsed_request.topK,

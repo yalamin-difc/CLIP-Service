@@ -97,6 +97,7 @@ class ClipServiceSecurityTests(unittest.TestCase):
         self.model_patch.stop()
         self.auth_patch.stop()
         clip_service.embedding_dimension = None
+        clip_service.preprocessing_version = None
         clip_service.model_warmup_completed = False
         clip_service.set_item_repository(clip_service.InMemoryItemRepository())
 
@@ -122,12 +123,15 @@ class ClipServiceSecurityTests(unittest.TestCase):
     def test_readiness_reports_safe_checks_and_stays_false_before_warmup(self):
         response = self.client.get("/health/ready")
         self.assertEqual(response.status_code, 503)
-        checks = response.json()["checks"]
+        body = response.json()
+        checks = body["checks"]
         self.assertEqual(
             set(checks),
             {
                 "modelLoaded",
                 "embeddingDimensionKnown",
+                "embeddingDimensionMatchesExpected",
+                "preprocessingVersionKnown",
                 "ocrDependencyReady",
                 "databaseReady",
                 "device",
@@ -135,6 +139,61 @@ class ClipServiceSecurityTests(unittest.TestCase):
             },
         )
         self.assertFalse(checks["warmupCompleted"])
+        self.assertEqual(body["expectedEmbeddingDimension"], clip_service.EXPECTED_EMBEDDING_DIMENSION)
+
+    def test_readiness_passes_once_warmup_dimension_matches_expected(self):
+        # OCR's real dependency (tesseract binary + language data) isn't
+        # installed in this test environment -- irrelevant to what this
+        # test is proving (dimension/preprocessing readiness), so it's
+        # patched out here the same way EXPECTED_EMBEDDING_DIMENSION
+        # already is above.
+        with patch.object(clip_service, "OCR_ENABLED", False), patch.object(
+            clip_service, "model", FakeModel()
+        ), patch.object(clip_service, "processor", FakeProcessor()):
+            clip_service.embedding_dimension = 3
+            clip_service.preprocessing_version = "fingerprint-abc"
+            clip_service.model_warmup_completed = True
+            response = self.client.get("/health/ready")
+        self.assertEqual(response.status_code, 200)
+        checks = response.json()["checks"]
+        self.assertTrue(checks["embeddingDimensionMatchesExpected"])
+        self.assertTrue(checks["preprocessingVersionKnown"])
+
+    def test_readiness_fails_when_live_embedding_dimension_does_not_match_expected(self):
+        # P1-7: a real, silent incompatibility -- e.g. a different model
+        # revision loaded than this deployment expects -- must fail
+        # readiness even though a dimension was produced ("known").
+        clip_service.embedding_dimension = 999
+        clip_service.preprocessing_version = "fingerprint-abc"
+        clip_service.model_warmup_completed = True
+        response = self.client.get("/health/ready")
+        self.assertEqual(response.status_code, 503)
+        checks = response.json()["checks"]
+        self.assertTrue(checks["embeddingDimensionKnown"])
+        self.assertFalse(checks["embeddingDimensionMatchesExpected"])
+
+    def test_readiness_fails_when_preprocessing_version_was_never_computed(self):
+        clip_service.embedding_dimension = 3
+        clip_service.preprocessing_version = None
+        clip_service.model_warmup_completed = True
+        response = self.client.get("/health/ready")
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.json()["checks"]["preprocessingVersionKnown"])
+
+    def test_health_dependency_report_carries_full_live_provenance(self):
+        clip_service.embedding_dimension = 3
+        clip_service.preprocessing_version = "fingerprint-abc"
+        response = self.client.get("/health", headers=identity_headers())
+        self.assertEqual(response.status_code, 200)
+        model = response.json()["dependencies"]["model"]
+        self.assertEqual(model["modelId"], clip_service.MODEL_NAME)
+        self.assertEqual(model["modelRevision"], clip_service.MODEL_REVISION)
+        self.assertEqual(model["embeddingDimension"], 3)
+        self.assertEqual(model["preprocessingVersion"], "fingerprint-abc")
+        self.assertEqual(model["scoringVersion"], clip_service.SCORING_VERSION)
+        self.assertEqual(model["serviceVersion"], clip_service.SERVICE_VERSION)
+        self.assertEqual(model["expectedEmbeddingDimension"], clip_service.EXPECTED_EMBEDDING_DIMENSION)
+        self.assertTrue(model["embeddingDimensionMatchesExpected"])
 
     def test_service_identity_is_mandatory(self):
         response = self.client.post("/match", data={"text": "red wallet"})

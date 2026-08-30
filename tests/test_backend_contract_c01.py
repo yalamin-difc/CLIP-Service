@@ -102,6 +102,7 @@ class BackendC01InteroperabilityTests(unittest.TestCase):
         self.dimension_patch = patch.object(clip_service, "EXPECTED_EMBEDDING_DIMENSION", 3)
         self.dimension_patch.start()
         clip_service.embedding_dimension = 3
+        clip_service.preprocessing_version = "fingerprint-c01-test"
         clip_service.set_item_repository(clip_service.InMemoryItemRepository())
         self.client = TestClient(clip_service.app)
 
@@ -110,6 +111,7 @@ class BackendC01InteroperabilityTests(unittest.TestCase):
         self.model_patch.stop()
         self.auth_patch.stop()
         clip_service.embedding_dimension = None
+        clip_service.preprocessing_version = None
         clip_service.set_item_repository(clip_service.InMemoryItemRepository())
 
     def create_item(self, item_id, tenant_id, site_id, color):
@@ -192,6 +194,14 @@ class BackendC01InteroperabilityTests(unittest.TestCase):
         self.assertEqual(matched.headers["X-Request-Id"], match_request_id)
         self.assertEqual(payload["requestId"], match_request_id)
         self.assertEqual(payload["governance"]["modelId"], clip_service.MODEL_NAME)
+        # P1-7: the response's own governance block now carries the full
+        # live provenance -- not just modelId/scoringVersion -- so Backend
+        # can persist exactly what produced THIS response as authoritative
+        # MatchDecision metadata without a second, potentially-racy call
+        # to /health.
+        self.assertEqual(payload["governance"]["modelRevision"], clip_service.MODEL_REVISION)
+        self.assertEqual(payload["governance"]["embeddingDimension"], 3)
+        self.assertEqual(payload["governance"]["preprocessingVersion"], "fingerprint-c01-test")
         self.assertEqual(payload["governance"]["scoringVersion"], clip_service.SCORING_VERSION)
         self.assertEqual(payload["governance"]["thresholds"]["minScore"], clip_service.CONF_MIN_SCORE)
         self.assertTrue(payload["governance"]["releasedOnly"])
@@ -311,6 +321,7 @@ class MatchRetrievalContractTests(unittest.TestCase):
         self.dimension_patch = patch.object(clip_service, "EXPECTED_EMBEDDING_DIMENSION", 3)
         self.dimension_patch.start()
         clip_service.embedding_dimension = 3
+        clip_service.preprocessing_version = "fingerprint-c01-test"
         clip_service.set_item_repository(clip_service.InMemoryItemRepository())
         self.client = TestClient(clip_service.app)
 
@@ -319,6 +330,7 @@ class MatchRetrievalContractTests(unittest.TestCase):
         self.model_patch.stop()
         self.auth_patch.stop()
         clip_service.embedding_dimension = None
+        clip_service.preprocessing_version = None
         clip_service.set_item_repository(clip_service.InMemoryItemRepository())
 
     def create_item(self, item_id, tenant_id, site_id, color):
