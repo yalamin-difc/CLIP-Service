@@ -1,4 +1,5 @@
 import io
+import os
 import time
 import unittest
 from unittest.mock import patch
@@ -14,7 +15,39 @@ from ocr_service import extract_ocr, ocr_dependency_ready
 from test_app import FakeModel, FakeProcessor, TEST_SECRET, identity_headers
 
 
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+# A real TTF (not PIL's built-in default bitmap font) is required here: the
+# Arabic test below renders with direction="rtl", which needs a FreeType
+# font loaded from a file for Raqm text-shaping to run at all. The font is
+# bundled in this repo (tests/assets/fonts/DejaVuSans.ttf) specifically so
+# these tests don't depend on a system font installed at some fixed,
+# Linux-distro-specific path -- a bare `/usr/share/fonts/...` path breaks on
+# macOS, Windows, and minimal/non-Debian Linux images. The system paths
+# below are kept only as a defensive fallback for a checkout where the
+# bundled asset is somehow missing (e.g. a broken sparse checkout).
+_BUNDLED_FONT_PATH = os.path.join(os.path.dirname(__file__), "assets", "fonts", "DejaVuSans.ttf")
+_FALLBACK_FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Debian/Ubuntu
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",  # Fedora/RHEL/CentOS
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",  # openSUSE
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",  # Arch
+    "/opt/homebrew/share/fonts/DejaVuSans.ttf",  # Homebrew, Apple Silicon
+    "/usr/local/share/fonts/DejaVuSans.ttf",  # Homebrew, Intel / manual installs
+    "C:\\Windows\\Fonts\\DejaVuSans.ttf",
+]
+
+
+def _resolve_font_path():
+    for candidate in [_BUNDLED_FONT_PATH, *_FALLBACK_FONT_PATHS]:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "No DejaVu Sans font found for OCR test image generation. Expected "
+        f"the bundled copy at {_BUNDLED_FONT_PATH} -- check the repository "
+        "checkout is complete."
+    )
+
+
+FONT_PATH = _resolve_font_path()
 
 
 def text_image(text, *, direction=None):
@@ -156,6 +189,56 @@ class OcrFailureIntegrationTests(unittest.TestCase):
             response = self.analyze()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["ocrError"], "OCR service is not available.")
+
+
+class FontResolutionPortabilityTests(unittest.TestCase):
+    """
+    P2-11: text_image() must not depend on a font installed at a fixed,
+    Linux-distro-specific system path -- it should resolve to the font
+    bundled in this repo on any platform, including one with none of the
+    Linux/macOS/Windows system font paths present at all.
+    """
+
+    def test_bundled_font_is_present_and_loadable(self):
+        self.assertTrue(
+            os.path.isfile(_BUNDLED_FONT_PATH),
+            "the bundled DejaVuSans.ttf is missing from the checkout",
+        )
+        # Loading it (not just checking existence) proves it's a real,
+        # parseable TTF -- not just a placeholder file.
+        ImageFont.truetype(_BUNDLED_FONT_PATH, 92)
+
+    def test_resolves_to_bundled_font_even_when_no_system_font_exists(self):
+        real_isfile = os.path.isfile
+
+        def only_bundled_exists(path):
+            if path == _BUNDLED_FONT_PATH:
+                return real_isfile(path)
+            return False
+
+        with patch.object(os.path, "isfile", side_effect=only_bundled_exists):
+            resolved = _resolve_font_path()
+        self.assertEqual(resolved, _BUNDLED_FONT_PATH)
+
+    def test_raises_a_clear_error_when_nothing_is_found(self):
+        with patch.object(os.path, "isfile", return_value=False):
+            with self.assertRaises(FileNotFoundError):
+                _resolve_font_path()
+
+    def test_falls_back_to_a_system_path_if_the_bundled_font_is_missing(self):
+        real_isfile = os.path.isfile
+        fallback = _FALLBACK_FONT_PATHS[0]
+
+        def bundled_missing(path):
+            if path == _BUNDLED_FONT_PATH:
+                return False
+            if path == fallback:
+                return True
+            return real_isfile(path)
+
+        with patch.object(os.path, "isfile", side_effect=bundled_missing):
+            resolved = _resolve_font_path()
+        self.assertEqual(resolved, fallback)
 
 
 if __name__ == "__main__":
