@@ -1,29 +1,37 @@
-# Use official Python base image
-FROM python:3.10-slim
-
-# Allow statements and log messages to immediately appear
-ENV PYTHONUNBUFFERED True
-
-# Install git for CLIP
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-
-# Set work dir
+FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+ 
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    INFERENCE_DEVICE=cpu \
+    STORAGE_MODE=mongodb
+ 
+RUN apt-get update && apt-get install -y \
+  git \
+  tesseract-ocr \
+  tesseract-ocr-eng \
+  tesseract-ocr-ara \
+  tesseract-ocr-fra \
+  curl \
+  && rm -rf /var/lib/apt/lists/*
+ 
+RUN useradd -m -u 10001 appuser
+ 
 WORKDIR /app
-
-# Copy dependencies
+ 
 COPY requirements.txt /app/
-
-# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy app code
+ 
 COPY . /app
-
-# Cloud Run provides PORT env variable
+ 
+ENV HF_HOME=/tmp/huggingface
+ENV TRANSFORMERS_CACHE=/tmp/huggingface
+ 
+USER appuser
+ 
 ENV PORT=8080
-
-# Expose port (for local testing)
 EXPOSE 8080
 
-# Run FastAPI with uvicorn
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD curl --fail http://127.0.0.1:${PORT}/health/live || exit 1
+ 
 CMD exec uvicorn app:app --host 0.0.0.0 --port $PORT

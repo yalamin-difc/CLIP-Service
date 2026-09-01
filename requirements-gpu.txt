@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cu124
 
 fastapi==0.141.1
 uvicorn==0.52.1
@@ -8,7 +8,7 @@ pytesseract==0.3.13
 zxing-cpp==3.1.1
 prometheus-client==0.26.0
 transformers==5.14.1
-torch==2.6.0+cpu
+torch==2.6.0
 python-multipart==0.0.32
 gunicorn==26.0.0
 numpy==2.4.4
