@@ -61,10 +61,14 @@ and barcode extraction. Real OCR and barcode scans also pass through the HTTP
 execution and serialization paths. Timeout, disabled OCR, missing dependency,
 invalid image, and oversized image cases pass.
 
+The process-local production default is `RATE_LIMIT_PER_MINUTE=120`. GitHub
+Actions and the full local suite set `RATE_LIMIT_PER_MINUTE=10000` so the suite
+is deterministic; production/default configuration is unchanged.
+
 Run:
 
 ```bash
-python3 -m unittest discover -s tests -v
+RATE_LIMIT_PER_MINUTE=10000 python3 -m unittest discover -s tests -v
 ```
 
 ## Model and device information

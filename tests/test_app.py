@@ -260,6 +260,25 @@ class ClipServiceSecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["requestId"], "req-matching")
 
+    def test_backend_c01_endpoints_cannot_omit_request_id(self):
+        cases = (
+            ("/items", ["corpus:write"], {"json": {"id": "no-rid", "title": "x"}}),
+            ("/items/item-1/release", ["corpus:release"], {}),
+            (
+                "/analyze-image",
+                ["match:execute"],
+                {"files": {"file": ("x.png", make_image_bytes(), "image/png")}},
+            ),
+            ("/match", ["match:execute"], {"data": {"text": "wallet"}}),
+        )
+        for path, actions, kwargs in cases:
+            with self.subTest(path=path):
+                headers = identity_headers(actions=actions, request_id=f"missing-{path}")
+                del headers["X-Request-Id"]
+                response = self.client.post(path, headers=headers, **kwargs)
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json()["error"]["code"], "missing_request_id")
+
     def test_action_permission_is_enforced(self):
         response = self.client.post(
             "/items",
