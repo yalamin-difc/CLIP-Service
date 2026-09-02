@@ -44,9 +44,11 @@ The tests issue an HS256 JWT with:
 - expiry;
 - signed request ID.
 
-The same request ID is sent in `X-Request-Id`. Tests reject invalid signatures,
-issuer, audience, missing identity context, expiry, disallowed site, missing
-action, and request-ID mismatch with the existing structured 401/403 contract.
+The same request ID is sent in `X-Request-Id` and is required on every
+authenticated internal call. Tests reject invalid signatures, issuer, audience,
+missing identity context, expiry, disallowed site, missing action, missing or
+blank `X-Request-Id`, and request-ID mismatch with the existing structured
+401/403 contract. Public `/health/live` and `/health/ready` remain unauthenticated.
 
 ## Response evidence
 

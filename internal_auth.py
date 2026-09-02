@@ -97,7 +97,9 @@ def require_identity(request: Request, action: str) -> ServiceIdentity:
         raise _auth_error(403, "action_not_permitted", f"Identity is not permitted to perform '{action}'.")
     request_id = claims["requestId"].strip()
     header_request_id = request.headers.get("X-Request-Id", "").strip()
-    if header_request_id and header_request_id != request_id:
+    if not header_request_id:
+        raise _auth_error(401, "missing_request_id", "X-Request-Id is required and must match the signed identity request ID.")
+    if header_request_id != request_id:
         raise _auth_error(401, "request_id_mismatch", "Identity request ID does not match the request.")
     return ServiceIdentity(
         service_name=claims["service"].strip(),

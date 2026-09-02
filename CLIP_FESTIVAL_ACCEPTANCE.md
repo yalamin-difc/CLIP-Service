@@ -34,8 +34,9 @@
 
 The service verifies HS256 internal JWTs using `INTERNAL_JWT_SECRET`. Required
 claims are issuer, audience, service, tenantId, siteId, siteIds, actions, expiry,
-and requestId. `siteId` must be included in `siteIds`; the JWT request ID must
-match `X-Request-Id`. Browsers do not receive signing credentials and must use
+and requestId. `siteId` must be included in `siteIds`; authenticated internal
+requests must include `X-Request-Id`, which must exactly match the JWT request
+ID. Browsers do not receive signing credentials and must use
 the authenticated backend.
 
 ## Storage requirements

@@ -4,7 +4,8 @@
 
 Corpus and matching APIs accept only HS256-signed internal JWTs. Tokens require
 issuer, audience, service name, tenant ID, selected site ID, permitted site IDs,
-actions, expiry, and request ID. The request ID claim must match `X-Request-Id`.
+actions, expiry, and request ID. Authenticated internal requests must include
+`X-Request-Id`, and that header must exactly match the signed request ID claim.
 Signing keys must come from a managed secret store, contain at least 256 bits of
 entropy, and be rotated outside the service image.
 

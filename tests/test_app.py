@@ -119,6 +119,15 @@ class ClipServiceSecurityTests(unittest.TestCase):
         response = self.client.get("/health/live")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(set(response.json()), {"status", "requestId"})
+        self.assertNotIn("X-Request-Id", response.request.headers)
+
+    def test_public_health_endpoints_do_not_require_request_id(self):
+        live = self.client.get("/health/live")
+        ready = self.client.get("/health/ready")
+        self.assertEqual(live.status_code, 200)
+        self.assertIn(ready.status_code, {200, 503})
+        self.assertNotEqual(live.json().get("error", {}).get("code"), "missing_request_id")
+        self.assertNotEqual(ready.json().get("error", {}).get("code"), "missing_request_id")
 
     def test_readiness_reports_safe_checks_and_stays_false_before_warmup(self):
         response = self.client.get("/health/ready")
@@ -227,6 +236,29 @@ class ClipServiceSecurityTests(unittest.TestCase):
         response = self.client.post("/match", headers=headers, data={"text": "wallet"})
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["code"], "request_id_mismatch")
+
+    def test_identity_request_id_header_is_required(self):
+        headers = identity_headers(actions=["match:execute"], request_id="req-missing-header")
+        del headers["X-Request-Id"]
+        response = self.client.post("/match", headers=headers, data={"text": "wallet"})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "missing_request_id")
+
+    def test_identity_request_id_blank_header_is_rejected(self):
+        headers = identity_headers(actions=["match:execute"], request_id="req-blank-header")
+        headers["X-Request-Id"] = "   "
+        response = self.client.post("/match", headers=headers, data={"text": "wallet"})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "missing_request_id")
+
+    def test_matching_request_id_is_accepted(self):
+        response = self.client.post(
+            "/match",
+            headers=identity_headers(actions=["match:execute"], request_id="req-matching"),
+            data={"text": "wallet"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["requestId"], "req-matching")
 
     def test_action_permission_is_enforced(self):
         response = self.client.post(
