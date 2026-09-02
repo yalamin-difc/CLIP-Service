@@ -15,6 +15,10 @@ import sys
 import time
 from typing import Any
 
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import httpx
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -24,7 +28,7 @@ from barcode_service import scan_barcodes
 from ocr_service import extract_ocr
 
 BASE_URL = os.environ.get("CLIP_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
-FONT_PATH = pathlib.Path(__file__).resolve().parents[1] / "tests" / "assets" / "fonts" / "DejaVuSans.ttf"
+FONT_PATH = ROOT / "tests" / "assets" / "fonts" / "DejaVuSans.ttf"
 BARCODE_VALUE = "DXB-FESTIVAL-2026-0417"
 FORBIDDEN_VECTOR_KEYS = {"embedding", "clipEmbedding"}
 

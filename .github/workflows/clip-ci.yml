@@ -69,6 +69,7 @@ jobs:
           secret = secrets.token_urlsafe(48)
           if len(secret.encode("utf-8")) < 32:
               raise SystemExit("generated INTERNAL_JWT_SECRET is shorter than 32 bytes")
+          print(f"::add-mask::{secret}", flush=True)
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
               handle.write(f"INTERNAL_JWT_SECRET={secret}\n")
           print("generated ephemeral INTERNAL_JWT_SECRET (>=32 bytes)")
@@ -143,6 +144,7 @@ jobs:
           secret = secrets.token_urlsafe(48)
           if len(secret.encode("utf-8")) < 32:
               raise SystemExit("generated INTERNAL_JWT_SECRET is shorter than 32 bytes")
+          print(f"::add-mask::{secret}", flush=True)
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
               handle.write(f"INTERNAL_JWT_SECRET={secret}\n")
           print("generated ephemeral INTERNAL_JWT_SECRET (>=32 bytes)")
@@ -224,7 +226,7 @@ jobs:
           exit 1
 
       - name: Validate OCR, barcode, and embedding-free responses
-        run: docker exec -e INTERNAL_JWT_SECRET -e CLIP_BASE_URL=http://127.0.0.1:8080 clip-cpu python /app/scripts/ci_cpu_smoke.py
+        run: docker exec -w /app -e PYTHONPATH=/app -e CLIP_BASE_URL=http://127.0.0.1:8080 clip-cpu python /app/scripts/ci_cpu_smoke.py
 
       - name: Capture container logs on failure
         if: failure()
