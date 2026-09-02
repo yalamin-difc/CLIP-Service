@@ -301,6 +301,18 @@ class BackendC01InteroperabilityTests(unittest.TestCase):
         self.assertEqual(mismatch.status_code, 401)
         self.assertEqual(mismatch.json()["error"]["code"], "request_id_mismatch")
 
+        missing_headers = service_headers(action="match:execute", request_id="missing-request-id")
+        del missing_headers["X-Request-Id"]
+        missing = self.client.post("/match", headers=missing_headers, data={"text": "wallet"})
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(missing.json()["error"]["code"], "missing_request_id")
+
+        blank_headers = service_headers(action="match:execute", request_id="blank-request-id")
+        blank_headers["X-Request-Id"] = "   "
+        blank = self.client.post("/match", headers=blank_headers, data={"text": "wallet"})
+        self.assertEqual(blank.status_code, 401)
+        self.assertEqual(blank.json()["error"]["code"], "missing_request_id")
+
 
 class MatchRetrievalContractTests(unittest.TestCase):
     """
