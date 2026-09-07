@@ -7,7 +7,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet
+from typing import Any, Dict, FrozenSet, Optional
 
 from fastapi import HTTPException, Request
 
@@ -26,7 +26,10 @@ class ServiceIdentity:
     permitted_site_ids: FrozenSet[str]
     actions: FrozenSet[str]
     request_id: str
-    dataset_version: str
+    # F-02: verified from signed JWT claims only -- never defaulted. None
+    # is the correct, valid value for production traffic (demo_data=False);
+    # it is never "festival-2026" or any other invented placeholder.
+    dataset_version: Optional[str]
     demo_data: bool
 
 
@@ -74,6 +77,50 @@ def decode_internal_jwt(token: str) -> Dict[str, Any]:
     return claims
 
 
+def _require_governance_claims(claims: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+    """F-02: verify the signed demoData/datasetVersion governance claims.
+
+    Never defaulted. A token missing demoData, or carrying a non-boolean
+    value, is rejected outright -- the historical behavior of silently
+    treating an absent claim as demoData=True (and datasetVersion as the
+    hardcoded "festival-2026") is removed entirely. See
+    docs/C01_BACKEND_INTEROPERABILITY.md for the full contract, which
+    Backend's utils/internalJwt.js signs identically:
+      - demoData must be an explicit boolean.
+      - When demoData is True, datasetVersion must be a non-empty string.
+      - When demoData is False, datasetVersion must be absent or JSON
+        null -- production traffic must never carry (or inherit) a
+        festival dataset version.
+    """
+    if "demoData" not in claims:
+        raise _auth_error(401, "missing_demo_data", "Internal identity token is missing the required demoData claim.")
+    demo_data = claims.get("demoData")
+    if not isinstance(demo_data, bool):
+        raise _auth_error(401, "invalid_demo_data", "Internal identity demoData claim must be an explicit boolean.")
+
+    dataset_version_raw = claims.get("datasetVersion")
+    if demo_data:
+        if not isinstance(dataset_version_raw, str) or not dataset_version_raw.strip():
+            raise _auth_error(
+                401,
+                "invalid_dataset_version",
+                "Internal identity datasetVersion claim must be a non-empty string when demoData is true.",
+            )
+        return True, dataset_version_raw.strip()
+
+    if dataset_version_raw is not None:
+        # A production identity (demoData=False) that also carries a
+        # dataset version is a contradictory claim set -- reject rather
+        # than silently pick one side (e.g. by ignoring the version), which
+        # would hide a Backend signing bug or a forged token.
+        raise _auth_error(
+            401,
+            "contradictory_demo_claims",
+            "Internal identity datasetVersion must be absent when demoData is false.",
+        )
+    return False, None
+
+
 def require_identity(request: Request, action: str) -> ServiceIdentity:
     authorization = request.headers.get("Authorization", "")
     if not authorization.startswith("Bearer "):
@@ -101,6 +148,7 @@ def require_identity(request: Request, action: str) -> ServiceIdentity:
         raise _auth_error(401, "missing_request_id", "X-Request-Id is required and must match the signed identity request ID.")
     if header_request_id != request_id:
         raise _auth_error(401, "request_id_mismatch", "Identity request ID does not match the request.")
+    demo_data, dataset_version = _require_governance_claims(claims)
     return ServiceIdentity(
         service_name=claims["service"].strip(),
         tenant_id=claims["tenantId"].strip(),
@@ -108,8 +156,8 @@ def require_identity(request: Request, action: str) -> ServiceIdentity:
         permitted_site_ids=permitted_sites,
         actions=permitted_actions,
         request_id=request_id,
-        dataset_version=str(claims.get("datasetVersion") or "festival-2026"),
-        demo_data=bool(claims.get("demoData", True)),
+        dataset_version=dataset_version,
+        demo_data=demo_data,
     )
 
 
