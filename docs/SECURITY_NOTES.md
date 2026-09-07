@@ -4,7 +4,13 @@
 
 Corpus and matching APIs accept only HS256-signed internal JWTs. Tokens require
 issuer, audience, service name, tenant ID, selected site ID, permitted site IDs,
-actions, expiry, and request ID. Authenticated internal requests must include
+actions, expiry, request ID, and two demo/production governance claims:
+`demoData` (an explicit boolean — never defaulted) and `datasetVersion` (a
+required non-empty string when `demoData` is `true`; must be absent/null
+when `demoData` is `false`). A token missing or misshaping either governance
+claim is rejected before any protected operation runs — see
+[`docs/C01_BACKEND_INTEROPERABILITY.md`](./C01_BACKEND_INTEROPERABILITY.md#demoproduction-governance-contract-f-02)
+for the exact contract. Authenticated internal requests must include
 `X-Request-Id`, and that header must exactly match the signed request ID claim.
 Signing keys must come from a managed secret store, contain at least 256 bits of
 entropy, and be rotated outside the service image.
@@ -16,7 +22,15 @@ trusted backend; CORS is not an authentication control.
 ## Data protection
 
 - Mongo queries include tenant and permitted-site predicates.
-- Candidate queries additionally require release and pinned-model compatibility.
+- Candidate queries additionally require release and pinned-model compatibility,
+  and are scoped to the signed identity's demo/production dataset: a demo
+  identity only matches candidates in its own signed `datasetVersion`; a
+  production identity only matches non-demo candidates and never inherits a
+  festival dataset.
+- Client input cannot set `demoData`/`datasetVersion` on a corpus item; both
+  are stamped from the signed identity and validated against any
+  already-stored item before an update, release, or re-embed is applied
+  (fail-closed `409` on a mismatch, with an audit-log entry).
 - API responses never contain embeddings.
 - Client input cannot set release state, status, thresholds, embeddings, model
   metadata, tenant metadata, or embedding dimensions.

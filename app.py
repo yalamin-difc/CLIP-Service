@@ -283,7 +283,9 @@ class MatchItemModel(StrictBaseModel):
     releasedAt: Optional[str] = None
     tenantId: str
     siteId: str
-    datasetVersion: str
+    # F-02: null for production items (demoData=False) -- never a festival
+    # placeholder. Only demo items (demoData=True) carry a real string here.
+    datasetVersion: Optional[str] = None
     demoData: bool
     createdBy: str
     modelId: str
@@ -1247,6 +1249,68 @@ def match_explanation(
     }
 
 
+def dataset_scope_query(identity: ServiceIdentity) -> Dict[str, Any]:
+    """F-02: candidate-eligibility scope for the signed identity's dataset.
+
+    A demo identity (demoData=True) only ever matches within its own
+    signed datasetVersion -- it must never unintentionally retrieve
+    candidates seeded under a different festival dataset version. A
+    production identity (demoData=False) only ever matches non-demo
+    corpus items; it has no datasetVersion to filter by (production
+    items never carry one), and must never inherit festival-2026 or any
+    other demo dataset's candidates.
+    """
+    if identity.demo_data:
+        return {"demoData": True, "datasetVersion": identity.dataset_version}
+    return {"demoData": {"$ne": True}}
+
+
+def item_in_dataset_scope(item: Mapping[str, Any], identity: ServiceIdentity) -> bool:
+    """In-memory equivalent of dataset_scope_query, for InMemoryItemRepository."""
+    if identity.demo_data:
+        return bool(item.get("demoData")) and item.get("datasetVersion") == identity.dataset_version
+    return not bool(item.get("demoData"))
+
+
+def assert_dataset_scope_consistent(existing: Optional[Mapping[str, Any]], identity: ServiceIdentity, *, item_id: str) -> None:
+    """F-02: fail closed when an update/release/re-embed identity disagrees
+    with an already-stored item's governance classification.
+
+    A production identity must never be able to release, re-embed, or
+    update an item that was created as demo data under a different
+    demoData/datasetVersion (or vice versa) -- that would silently
+    reclassify the item's provenance. Existing items with no prior
+    governance metadata (pre-F-02 records) are exempt from this check on
+    their first touch under the new contract; the update itself then
+    stamps the current identity's values going forward.
+    """
+    if not existing:
+        return
+    if "demoData" not in existing and "datasetVersion" not in existing:
+        return
+    existing_demo = bool(existing.get("demoData"))
+    existing_version = existing.get("datasetVersion")
+    if existing_demo != identity.demo_data or existing_version != identity.dataset_version:
+        get_repository().add_audit_log(
+            "governance_mismatch_rejected",
+            {
+                "existingDemoData": existing_demo,
+                "existingDatasetVersion": existing_version,
+                "identityDemoData": identity.demo_data,
+                "identityDatasetVersion": identity.dataset_version,
+            },
+            item_id=item_id,
+            tenant_id=identity.tenant_id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=problem_detail(
+                "governance_mismatch",
+                f"Item '{item_id}' governance (demoData/datasetVersion) does not match the signed identity.",
+            ),
+        )
+
+
 class ItemRepository:
     def health(self) -> Dict[str, Any]:
         raise NotImplementedError
@@ -1342,6 +1406,9 @@ class InMemoryItemRepository(ItemRepository):
                 and value.get("modelId") == MODEL_NAME
                 and value.get("modelRevision") == MODEL_REVISION
                 and value.get("embeddingDimension") == (embedding_dimension or EXPECTED_EMBEDDING_DIMENSION)
+                # F-02: demo queries never match a different demo dataset;
+                # production queries never inherit festival candidates.
+                and item_in_dataset_scope(value, identity)
             ]
         items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
         return items[:limit]
@@ -1429,6 +1496,9 @@ class MongoItemRepository(ItemRepository):
         self._audit = self._client[database][audit_collection]
         self._items.create_index([("tenantId", 1), ("siteId", 1), ("id", 1)], unique=True)
         self._items.create_index([("tenantId", 1), ("siteId", 1), ("status", 1), ("modelId", 1), ("modelRevision", 1)])
+        # F-02: supports list_released_items' dataset_scope_query filter
+        # (demoData / datasetVersion) added to the /match candidate query.
+        self._items.create_index([("tenantId", 1), ("siteId", 1), ("demoData", 1), ("datasetVersion", 1)])
         self._items.create_index([("status", 1), ("updatedAt", -1)])
         self._audit.create_index([("ts", -1)])
         self._audit.create_index([("itemId", 1), ("ts", -1)])
@@ -1489,6 +1559,10 @@ class MongoItemRepository(ItemRepository):
                     "modelId": MODEL_NAME,
                     "modelRevision": MODEL_REVISION,
                     "embeddingDimension": embedding_dimension or EXPECTED_EMBEDDING_DIMENSION,
+                    # F-02: demo queries never match a different demo
+                    # dataset; production queries never inherit festival
+                    # candidates.
+                    **dataset_scope_query(identity),
                 }
             )
             .sort("updatedAt", -1)
@@ -2148,6 +2222,10 @@ async def upsert_item(request: Request):
     manual_barcode_supplied = "barcodes" in normalized_patch or "barcodeValues" in normalized_patch
 
     existing = get_repository().get_item(normalized_patch["id"], identity)
+    # F-02: fail closed rather than silently reclassifying an item's
+    # governance metadata if this identity's demoData/datasetVersion
+    # disagrees with what was already stored for it.
+    assert_dataset_scope_consistent(existing, identity, item_id=normalized_patch["id"])
     stored_item = prepare_item_for_storage(existing, normalized_patch, identity)
     # A manual signal is provenance-tagged as soon as it's supplied, even
     # without an image in the same request (e.g. a metadata-only correction
@@ -2244,6 +2322,9 @@ def release_item(request: Request, item_id: str):
     existing = get_repository().get_item(item_id, identity)
     if existing is None:
         raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
+    # F-02: a production identity must never release a demo item (or vice
+    # versa) -- that would silently move it into a different candidate pool.
+    assert_dataset_scope_consistent(existing, identity, item_id=item_id)
     if not existing.get("embedding"):
         raise HTTPException(
             status_code=409,
@@ -2292,6 +2373,9 @@ async def reembed_item(request: Request, item_id: str, file: UploadFile = File(.
     existing = get_repository().get_item(item_id, identity)
     if existing is None:
         raise HTTPException(status_code=404, detail=problem_detail("item_not_found", f"Item '{item_id}' was not found."))
+    # F-02: a production identity must never re-embed a demo item (or vice
+    # versa) under its own governance context.
+    assert_dataset_scope_consistent(existing, identity, item_id=item_id)
     _, image = await read_image_upload(file, "file")
     existing["embedding"] = await run_image_embedding(image)
     existing["clipEmbedding"] = existing["embedding"]

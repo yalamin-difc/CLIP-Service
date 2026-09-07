@@ -60,21 +60,28 @@ def identity_headers(
     actions=None,
     service="festival-backend",
     request_id=None,
+    issuer=None,
+    audience=None,
+    demo_data=True,
+    dataset_version="festival-v1",
+    omit=(),
 ):
     request_id = request_id or f"req-{time.time_ns()}"
     claims = {
-        "iss": internal_auth.JWT_ISSUER,
-        "aud": internal_auth.JWT_AUDIENCE,
+        "iss": issuer if issuer is not None else internal_auth.JWT_ISSUER,
+        "aud": audience if audience is not None else internal_auth.JWT_AUDIENCE,
         "service": service,
         "tenantId": tenant,
         "siteId": site,
         "siteIds": sites or [site],
-        "datasetVersion": "festival-v1",
-        "demoData": True,
+        "datasetVersion": dataset_version,
+        "demoData": demo_data,
         "actions": actions if actions is not None else ALL_ACTIONS,
         "requestId": request_id,
         "exp": int(time.time()) + 300,
     }
+    for claim in omit:
+        claims.pop(claim, None)
     token = internal_auth.sign_internal_token(claims, TEST_SECRET)
     return {"Authorization": f"Bearer {token}", "X-Request-Id": request_id}
 
