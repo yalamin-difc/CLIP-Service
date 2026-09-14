@@ -982,11 +982,38 @@ def image_embedding_for(image: Image.Image) -> List[float]:
     return embedding
 
 
+# CLIP ViT-B/32's positional-embedding table only has this many rows --
+# a tokenized sequence longer than it makes get_text_features index out
+# of bounds rather than raise a clean error. Used only as a fallback:
+# text_max_tokens() below prefers the tokenizer's own configured value.
+CLIP_TEXT_CONTEXT_LENGTH = 77
+
+
+def text_max_tokens(processor_instance) -> int:
+    tokenizer = getattr(processor_instance, "tokenizer", None)
+    configured = getattr(tokenizer, "model_max_length", None) if tokenizer is not None else None
+    # Some tokenizer configs leave this at HF's "unset" sentinel (a huge
+    # int, e.g. 1e30) when no limit was recorded -- anything outside a
+    # sane token-count range isn't a real answer, so fall back rather
+    # than pass it straight to the model.
+    if isinstance(configured, int) and 8 <= configured <= 512:
+        return configured
+    return CLIP_TEXT_CONTEXT_LENGTH
+
+
 def text_embedding_for(text: str) -> List[float]:
     global embedding_dimension
     model_instance, processor_instance = load_model()
     try:
-        inputs = _move_inputs_to_device(processor_instance(text=[text], return_tensors="pt", padding=True))
+        inputs = _move_inputs_to_device(
+            processor_instance(
+                text=[text],
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=text_max_tokens(processor_instance),
+            )
+        )
         with inference_mode():
             features = _feature_tensor(model_instance.get_text_features(**inputs))
     except HTTPException:
@@ -1147,6 +1174,19 @@ async def apply_candidate_signals(stored_item: Dict[str, Any], pil_image: Image.
 
 
 def softmax_confidences(scores: List[float], temperature: float = 0.07) -> List[float]:
+    """
+    Normalize a candidate set's raw cosine scores into values that sum to 1.
+
+    This is relative-only: it says how a candidate compares to the other
+    candidates actually passed in, nothing more. It is NOT a calibrated
+    probability of correctness or of ownership, and it carries no meaning
+    on its own outside the set it was computed over -- the same raw score
+    yields a different confidence depending on what else is in `scores`.
+    In particular, a single-candidate set (topK=1) always returns [1.0]
+    regardless of how weak the underlying match is; callers must not read
+    that 1.0 as "100% certain" -- check the raw score / should_return_no_match
+    instead for whether the match is trustworthy at all.
+    """
     if not scores:
         return []
     t = temperature if temperature > 0 else 0.07
