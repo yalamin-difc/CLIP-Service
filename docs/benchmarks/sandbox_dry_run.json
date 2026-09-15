@@ -1,0 +1,21 @@
+{
+  "generatedAt": "2026-09-15T16:02:07Z",
+  "environment": {
+    "python": "3.11.15",
+    "platform": "Linux-6.18.44-fc-v33-x86_64-with-glibc2.39",
+    "cpuCount": 4
+  },
+  "iterationsPerMeasurement": 5,
+  "engines": {
+    "clip_v1": {
+      "engine": "clip_v1",
+      "status": "skipped",
+      "reason": "Cold start failed: HTTPException: 503: {'code': 'model_unavailable', 'message': 'CLIP model dependencies are not installed.'}"
+    },
+    "siglip2_v1": {
+      "engine": "siglip2_v1",
+      "status": "skipped",
+      "reason": "siglip2_v1 is disabled by configuration (is_enabled() returned False)."
+    }
+  }
+}
