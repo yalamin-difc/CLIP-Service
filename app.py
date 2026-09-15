@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from embedding_engines import config as engine_config
 from internal_auth import ServiceIdentity, require_identity, validate_auth_configuration
 
 try:  # pragma: no cover - optional runtime dependency
@@ -144,12 +145,30 @@ if Counter is not None:
     METRIC_MODEL_LOADED = Gauge("clip_service_model_loaded", "Model loaded (1/0)")
     METRIC_MATCH_RESULTS = Counter("clip_service_match_results_total", "Match outcomes", ["outcome"])
     METRIC_MATCH_FAILURES = Counter("clip_service_match_failures_total", "Match failures", ["code"])
+    # P13: engine-labeled metrics for the /v2 surface. `engine` only ever
+    # takes the small, fixed set of registered engine ids (currently
+    # clip_v1/siglip2_v1) -- never a caller-controlled string -- so this
+    # stays low-cardinality.
+    METRIC_ENGINE_REQUESTS = Counter(
+        "clip_service_engine_requests_total", "Per-engine V2 requests", ["engine", "modality", "status"]
+    )
+    METRIC_ENGINE_LATENCY = Histogram(
+        "clip_service_engine_inference_latency_seconds", "Per-engine inference latency", ["engine", "modality"]
+    )
+    METRIC_ENGINE_LOAD_SECONDS = Histogram("clip_service_engine_load_seconds", "Per-engine model load time", ["engine"])
+    METRIC_ENGINE_MATCH_LATENCY = Histogram(
+        "clip_service_engine_match_latency_seconds", "Per-engine end-to-end match latency", ["engine"]
+    )
 else:  # pragma: no cover
     METRIC_REQUESTS = None
     METRIC_LATENCY = None
     METRIC_MODEL_LOADED = None
     METRIC_MATCH_RESULTS = None
     METRIC_MATCH_FAILURES = None
+    METRIC_ENGINE_REQUESTS = None
+    METRIC_ENGINE_LATENCY = None
+    METRIC_ENGINE_LOAD_SECONDS = None
+    METRIC_ENGINE_MATCH_LATENCY = None
 
 
 class StrictBaseModel(BaseModel):
@@ -485,6 +504,24 @@ def record_match_outcome(outcome: str) -> None:
 def record_match_failure(code: str) -> None:
     if METRIC_MATCH_FAILURES is not None:
         METRIC_MATCH_FAILURES.labels(code=code).inc()
+
+
+def record_engine_inference(engine: str, modality: str, status: str, duration_s: Optional[float] = None) -> None:
+    """P13: per-engine encode/match observability for the /v2 surface.
+    `modality` is one of "image", "text", "match". Never raises -- a
+    metrics-recording failure must not affect the request it describes."""
+    if METRIC_ENGINE_REQUESTS is not None:
+        METRIC_ENGINE_REQUESTS.labels(engine=engine, modality=modality, status=status).inc()
+    if duration_s is not None:
+        if modality == "match" and METRIC_ENGINE_MATCH_LATENCY is not None:
+            METRIC_ENGINE_MATCH_LATENCY.labels(engine=engine).observe(max(0.0, duration_s))
+        elif METRIC_ENGINE_LATENCY is not None:
+            METRIC_ENGINE_LATENCY.labels(engine=engine, modality=modality).observe(max(0.0, duration_s))
+
+
+def record_engine_load_seconds(engine: str, duration_s: float) -> None:
+    if METRIC_ENGINE_LOAD_SECONDS is not None:
+        METRIC_ENGINE_LOAD_SECONDS.labels(engine=engine).observe(max(0.0, duration_s))
 
 
 def request_latency_ms(request: Request) -> int:
@@ -1404,6 +1441,16 @@ class ItemRepository:
     def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
+    def list_matchable_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
+        """P13: released+eligible candidates in this identity's tenant/site/
+        dataset scope, WITHOUT the CLIP-specific modelId/modelRevision/
+        embeddingDimension filter that list_released_items applies -- the
+        V2 API (v2_router.py) validates model/engine/dimension compatibility
+        itself, per candidate, per engine, so a candidate that hasn't been
+        re-embedded for a given engine is simply skipped rather than
+        excluded from the query entirely."""
+        raise NotImplementedError
+
     def add_audit_log(
         self,
         event_type: str,
@@ -1487,6 +1534,20 @@ class InMemoryItemRepository(ItemRepository):
         items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
         return items[:limit]
 
+    def list_matchable_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = [
+                dict(value)
+                for value in self._items.values()
+                if value.get("tenantId") == identity.tenant_id
+                and value.get("siteId") in identity.permitted_site_ids
+                and value.get("released")
+                and value.get("eligibleForMatching")
+                and item_in_dataset_scope(value, identity)
+            ]
+        items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
+        return items[:limit]
+
     def add_audit_log(
         self,
         event_type: str,
@@ -1545,6 +1606,9 @@ class UnavailableItemRepository(ItemRepository):
     def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
         self._raise()
 
+    def list_matchable_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
+        self._raise()
+
     def add_audit_log(
         self,
         event_type: str,
@@ -1574,6 +1638,11 @@ class MongoItemRepository(ItemRepository):
         # (demoData / datasetVersion) added to the /match candidate query.
         self._items.create_index([("tenantId", 1), ("siteId", 1), ("demoData", 1), ("datasetVersion", 1)])
         self._items.create_index([("status", 1), ("updatedAt", -1)])
+        # P13: supports V2 per-engine candidate lookups (list_matchable_items
+        # + per-engine filtering in v2_router.py) without a destructive
+        # migration -- additive only, alongside the legacy embedding fields.
+        self._items.create_index([("tenantId", 1), ("siteId", 1), ("embeddings.clip_v1.modelId", 1)])
+        self._items.create_index([("tenantId", 1), ("siteId", 1), ("embeddings.siglip2_v1.modelId", 1)])
         self._audit.create_index([("ts", -1)])
         self._audit.create_index([("itemId", 1), ("ts", -1)])
 
@@ -1636,6 +1705,22 @@ class MongoItemRepository(ItemRepository):
                     # F-02: demo queries never match a different demo
                     # dataset; production queries never inherit festival
                     # candidates.
+                    **dataset_scope_query(identity),
+                }
+            )
+            .sort("updatedAt", -1)
+            .limit(limit)
+        )
+        return [self._clean_item(item) for item in cursor if item is not None]
+
+    def list_matchable_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
+        cursor = (
+            self._items.find(
+                {
+                    "tenantId": identity.tenant_id,
+                    "siteId": {"$in": list(identity.permitted_site_ids)},
+                    "released": True,
+                    "eligibleForMatching": True,
                     **dataset_scope_query(identity),
                 }
             )
@@ -1764,6 +1849,7 @@ def parse_item_payload(raw_payload: Mapping[str, Any]) -> Dict[str, Any]:
         "eligibleForMatching",
         "embedding",
         "clipEmbedding",
+        "embeddings",
         "modelId",
         "modelRevision",
         "embeddingDimension",
@@ -2030,6 +2116,54 @@ except OSError:  # pragma: no cover - template ships with the repo/image
 
 _UNAVAILABLE = "Unavailable"
 
+# P13 section 24: rendered only when AB_UI_ENABLED=true (see render_console_html
+# below). Exactly like the existing "Image Analysis" card, this section never
+# calls a protected CLIP endpoint and never signs a JWT from the browser --
+# it is explanatory only, consistent with this console's existing security
+# model (a signed internal service identity can never be issued to a
+# browser). No raw vectors are ever rendered.
+_AB_COMPARISON_SECTION_HTML = """
+      <section class="card" id="ab-comparison-card">
+        <h2 data-i18n="abTitle">AI Model Comparison</h2>
+        <p class="analysis-unavailable" data-i18n="abUnavailableNotice">
+          Live side-by-side comparison is not enabled in this public demonstration console.
+          Protected CLIP/SigLIP2 operations require a signed internal service identity that can
+          never be issued to a browser. Ask the Urban Intelligence Backend team about a
+          demo-safe server-side facade for authorized demonstrators.
+        </p>
+        <div class="grid grid--2 result-panels">
+          <div class="result-panel">
+            <h3>CLIP ViT-B/32 (clip_v1)</h3>
+            <p class="muted" data-i18n="abLatency">Latency</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+            <p class="muted" data-i18n="abTopCandidate">Top candidate</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+            <p class="muted" data-i18n="similarity">Similarity</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+            <p class="muted" data-i18n="abStatus">Model status</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+          </div>
+          <div class="result-panel">
+            <h3>SigLIP2 So400M (siglip2_v1)</h3>
+            <p class="muted" data-i18n="abLatency">Latency</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+            <p class="muted" data-i18n="abTopCandidate">Top candidate</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+            <p class="muted" data-i18n="similarity">Similarity</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+            <p class="muted" data-i18n="abStatus">Model status</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+          </div>
+        </div>
+        <p class="card__footnote"><strong data-i18n="abDisclaimer">AI-assisted candidate retrieval — human verification required.</strong></p>
+        <p class="card__footnote" data-i18n="abCalibrationWarning">
+          SigLIP2 is an experimental, uncalibrated engine: its similarity scores are not directly
+          comparable to CLIP's scores or to each other, and neither engine's score is an ownership
+          probability. A higher number never means a more certain match.
+        </p>
+      </section>
+"""
+
 
 def _display_value(value: Optional[Any]) -> str:
     """Never fabricate: an unknown provenance field renders literally as
@@ -2048,6 +2182,9 @@ def render_console_html() -> str:
         raise HTTPException(status_code=503, detail=problem_detail("console_unavailable", "Console template is missing."))
     provenance = runtime_provenance()
     rendered = _CONSOLE_TEMPLATE
+    rendered = rendered.replace(
+        "{{AB_COMPARISON_SECTION}}", _AB_COMPARISON_SECTION_HTML if engine_config.AB_UI_ENABLED else ""
+    )
     for token, value in (
         ("MODEL_ID", provenance["modelId"]),
         ("MODEL_REVISION", provenance["modelRevision"]),
@@ -2065,6 +2202,16 @@ def home(request: Request):
     return HTMLResponse(render_console_html())
 
 
+def engines_health() -> Dict[str, Any]:
+    """P13: additive per-engine health block. Never affects `status` above
+    -- a disabled or unavailable SigLIP2 engine is expected default state,
+    not a degraded CLIP service, so it must never flip the top-level
+    /health status or /health/ready readiness."""
+    from embedding_engines.registry import describe_models
+
+    return {model["engine"]: model for model in describe_models()}
+
+
 @app.get("/health")
 def health(request: Request):
     authorize(request, "health:read")
@@ -2078,6 +2225,10 @@ def health(request: Request):
                 "model": model_health(),
                 "store": store_health,
             },
+            # Additive only: existing consumers reading dependencies.model /
+            # dependencies.store see no change. New consumers can read
+            # per-engine (clip_v1/siglip2_v1) readiness here.
+            "engines": engines_health(),
         },
     )
 
@@ -2735,3 +2886,15 @@ async def match(request: Request):
     record_latency_metric(endpoint, started)
     record_request_metric(endpoint, 200)
     return response
+
+
+# P13: the V2 model-engine-aware API surface (GET /v2/models, POST
+# /v2/embeddings/*, POST /v2/items/{id}/embeddings/{engine}, POST
+# /v2/match, POST /v2/ab/match). Imported at the bottom of this module,
+# after every name v2_router.py needs (authorize, get_repository,
+# problem_detail, ...) is already defined, so its own deferred `import app`
+# always sees a fully-initialized module. Every legacy endpoint above this
+# line is completely unaffected by this import.
+from v2_router import router as v2_router  # noqa: E402
+
+app.include_router(v2_router)
