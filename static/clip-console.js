@@ -80,6 +80,20 @@
       openApiSpec: "OpenAPI Specification",
       systemReadiness: "System Readiness",
       footerNote: "Demonstration console — synthetic festival data only.",
+      abTitle: "AI Model Comparison",
+      abUnavailableNotice:
+        "Live side-by-side comparison is not enabled in this public demonstration console. " +
+        "Protected CLIP/SigLIP2 operations require a signed internal service identity that can " +
+        "never be issued to a browser. Ask the Urban Intelligence Backend team about a demo-safe " +
+        "server-side facade for authorized demonstrators.",
+      abLatency: "Latency",
+      abTopCandidate: "Top candidate",
+      abStatus: "Model status",
+      abDisclaimer: "AI-assisted candidate retrieval — human verification required.",
+      abCalibrationWarning:
+        "SigLIP2 is an experimental, uncalibrated engine: its similarity scores are not directly " +
+        "comparable to CLIP's scores or to each other, and neither engine's score is an ownership " +
+        "probability. A higher number never means a more certain match.",
     },
     ar: {
       title: "محرك CLIP للذكاء الاصطناعي",
@@ -150,6 +164,20 @@
       openApiSpec: "مواصفات OpenAPI",
       systemReadiness: "جاهزية النظام",
       footerNote: "لوحة تجريبية — بيانات مهرجان تركيبية فقط.",
+      abTitle: "مقارنة نماذج الذكاء الاصطناعي",
+      abUnavailableNotice:
+        "المقارنة المباشرة جنبًا إلى جنب غير مفعّلة في هذه اللوحة التجريبية العامة. تتطلب " +
+        "عمليات CLIP/SigLIP2 المحمية هوية خدمة داخلية موقّعة لا يمكن إصدارها إلى المتصفح " +
+        "مطلقًا. تواصل مع فريق الخلفية البرمجية للذكاء الحضري بخصوص واجهة عرض تجريبية آمنة " +
+        "من جهة الخادم للعارضين المصرّح لهم.",
+      abLatency: "زمن الاستجابة",
+      abTopCandidate: "أفضل مرشح",
+      abStatus: "حالة النموذج",
+      abDisclaimer: "استرجاع مرشحين بمساعدة الذكاء الاصطناعي — يتطلب التحقق البشري.",
+      abCalibrationWarning:
+        "SigLIP2 محرك تجريبي غير معاير: درجات التشابه فيه غير قابلة للمقارنة المباشرة مع " +
+        "درجات CLIP أو مع بعضها البعض، ولا تمثل درجة أي من المحركين احتمال ملكية. الدرجة " +
+        "الأعلى لا تعني أبدًا مطابقة أكثر يقينًا.",
     },
   };
 
