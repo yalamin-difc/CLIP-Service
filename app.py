@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import io
 import json
 import logging
 import os
+import pathlib
 import re
 import threading
 import time
@@ -21,6 +23,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, 
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -103,6 +106,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Festival console: static assets for the "/" landing page only. Every
+# protected API route below is untouched -- this mount serves CSS/JS files,
+# nothing else.
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+TEMPLATES_DIR = BASE_DIR / "templates"
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# CSP is scoped to the console page and its static assets only, so it never
+# interferes with Swagger's ("/docs") or ReDoc's ("/redoc") own script/style
+# loading. nosniff and Referrer-Policy are safe to apply to every response.
+_CONSOLE_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; "
+    "img-src 'self' data: blob:; connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    path = request.url.path
+    if path == "/" or path.startswith("/static/"):
+        response.headers["Content-Security-Policy"] = _CONSOLE_CSP
+        response.headers["X-Frame-Options"] = "DENY"
+    return response
+
 
 if Counter is not None:
     METRIC_REQUESTS = Counter("clip_service_requests_total", "Requests", ["endpoint", "status"])
@@ -1989,9 +2023,46 @@ def metrics(request: Request):
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.get("/")
+try:
+    _CONSOLE_TEMPLATE = (TEMPLATES_DIR / "clip-console.html").read_text(encoding="utf-8")
+except OSError:  # pragma: no cover - template ships with the repo/image
+    _CONSOLE_TEMPLATE = None
+
+_UNAVAILABLE = "Unavailable"
+
+
+def _display_value(value: Optional[Any]) -> str:
+    """Never fabricate: an unknown provenance field renders literally as
+    "Unavailable" rather than a made-up placeholder. Values that ARE known
+    (MODEL_NAME/MODEL_REVISION/SCORING_VERSION/SERVICE_VERSION are fixed
+    constants; embedding_dimension/preprocessing_version are the real,
+    live module state set once warm-up actually succeeds) are escaped and
+    rendered as-is."""
+    if value is None or value == "":
+        return _UNAVAILABLE
+    return html.escape(str(value))
+
+
+def render_console_html() -> str:
+    if _CONSOLE_TEMPLATE is None:  # pragma: no cover - defensive only
+        raise HTTPException(status_code=503, detail=problem_detail("console_unavailable", "Console template is missing."))
+    provenance = runtime_provenance()
+    rendered = _CONSOLE_TEMPLATE
+    for token, value in (
+        ("MODEL_ID", provenance["modelId"]),
+        ("MODEL_REVISION", provenance["modelRevision"]),
+        ("EMBEDDING_DIMENSION", provenance["embeddingDimension"]),
+        ("PREPROCESSING_VERSION", provenance["preprocessingVersion"]),
+        ("SCORING_VERSION", provenance["scoringVersion"]),
+        ("SERVICE_VERSION", provenance["serviceVersion"]),
+    ):
+        rendered = rendered.replace("{{" + token + "}}", _display_value(value))
+    return rendered
+
+
+@app.get("/", response_class=HTMLResponse)
 def home(request: Request):
-    return with_request_id(request, {"status": "ok"})
+    return HTMLResponse(render_console_html())
 
 
 @app.get("/health")

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en" id="doc-root">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CLIP AI Engine — Al-Amen Technology</title>
+    <link rel="stylesheet" href="/static/clip-console.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar__brand">
+        <span class="topbar__org">AL-AMEN TECHNOLOGY</span>
+        <span class="topbar__product" data-i18n="title">CLIP AI Engine</span>
+      </div>
+      <div class="topbar__actions">
+        <span class="lang-toggle" role="group" aria-label="Language">
+          <button type="button" id="lang-en" class="lang-btn is-active" data-lang="en">English</button>
+          <span class="lang-sep">|</span>
+          <button type="button" id="lang-ar" class="lang-btn" data-lang="ar">العربية</button>
+        </span>
+      </div>
+    </header>
+
+    <div class="festival-banner">
+      <span data-i18n="festivalBanner">Dubai AI Festival 2026 — Demonstration Environment</span>
+      <span class="demo-pill" data-i18n="demoDataPill">DEMO DATA · بيانات تجريبية</span>
+    </div>
+
+    <main class="page">
+      <section class="hero">
+        <h1 data-i18n="title">CLIP AI Engine</h1>
+        <p class="hero__subtitle">
+          <span data-i18n="subtitleLine1">Multimodal Intelligence for Lost &amp; Found</span><br />
+          <span data-i18n="subtitleLine2">Urban Intelligence Platform</span>
+        </p>
+        <p class="hero__story" data-i18n="festivalStory">
+          CLIP is one intelligence layer of Al-Amen Technology's AI-powered Lost &amp; Found / Urban
+          Intelligence Platform. It converts visual and textual evidence into comparable
+          representations, retrieves relevant candidates, and combines with OCR and barcode signals.
+          Final match decisions remain governed by the Urban Intelligence Backend and human review.
+        </p>
+      </section>
+
+      <section class="grid grid--2">
+        <div class="card" id="status-card">
+          <h2 data-i18n="serviceStatus">Service Status</h2>
+          <div class="status-row">
+            <span class="status-dot" id="status-dot" data-state="unknown"></span>
+            <span id="status-label" data-i18n="unavailable">Unavailable</span>
+          </div>
+          <dl class="kv" id="status-kv">
+            <div class="kv__row">
+              <dt data-i18n="model">Model</dt>
+              <dd id="status-model">—</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="ocr">OCR</dt>
+              <dd id="status-ocr">—</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="storage">Storage</dt>
+              <dd id="status-storage">—</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="device">Device</dt>
+              <dd id="status-device">—</dd>
+            </div>
+          </dl>
+          <p class="card__footnote" data-i18n="statusSource">
+            Live values from the public readiness endpoint (/health/ready).
+          </p>
+        </div>
+
+        <div class="card" id="provenance-card">
+          <h2 data-i18n="modelProvenance">Model Provenance</h2>
+          <dl class="kv">
+            <div class="kv__row">
+              <dt data-i18n="modelId">Model ID</dt>
+              <dd>{{MODEL_ID}}</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="modelRevision">Model revision</dt>
+              <dd class="mono">{{MODEL_REVISION}}</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="embeddingDimension">Embedding dimension</dt>
+              <dd>{{EMBEDDING_DIMENSION}}</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="preprocessingVersion">Preprocessing version</dt>
+              <dd class="mono">{{PREPROCESSING_VERSION}}</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="scoringVersion">Scoring version</dt>
+              <dd class="mono">{{SCORING_VERSION}}</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="serviceVersion">Service version</dt>
+              <dd class="mono">{{SERVICE_VERSION}}</dd>
+            </div>
+          </dl>
+          <p class="card__footnote" data-i18n="provenanceNote">
+            Model provenance is captured to ensure matching results can be traced to the AI
+            configuration used during inference.
+          </p>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 data-i18n="pipelineTitle">AI Pipeline</h2>
+        <ol class="pipeline">
+          <li><span data-i18n="pStepImage">Image</span></li>
+          <li><span data-i18n="pStepPreprocess">Preprocessing</span></li>
+          <li><span>CLIP ViT-B/32</span></li>
+          <li><span id="pipeline-vector" data-i18n="pStepVector">Vector representation</span></li>
+          <li><span data-i18n="pStepRetrieval">Authorized corpus retrieval</span></li>
+          <li><span data-i18n="pStepSignals">OCR + barcode signals</span></li>
+          <li><span data-i18n="pStepRanked">Ranked candidates</span></li>
+          <li><span data-i18n="pStepFusion">Backend multimodal fusion</span></li>
+          <li><span data-i18n="pStepReview">Human review</span></li>
+        </ol>
+      </section>
+
+      <section class="card" id="analysis-card">
+        <h2 data-i18n="imageAnalysis">Image Analysis</h2>
+        <p class="analysis-unavailable" data-i18n="analysisUnavailableNotice">
+          Live image analysis is not enabled in this public demonstration console. Protected CLIP
+          operations require a signed internal service identity that can never be issued to a
+          browser. See the API documentation below, or ask the Urban Intelligence Backend team
+          about a demo-safe server-side facade.
+        </p>
+        <div class="upload-shell" aria-disabled="true">
+          <label class="upload-drop" id="upload-drop" for="upload-input">
+            <span data-i18n="uploadLabel">Upload Lost/Found Item Image</span>
+            <input type="file" id="upload-input" accept="image/jpeg,image/png,image/webp" disabled />
+          </label>
+          <div class="preview-box" id="preview-box">
+            <img id="preview-img" alt="" hidden />
+            <span id="preview-empty" data-i18n="previewPlaceholder">No image selected</span>
+          </div>
+        </div>
+
+        <div class="grid grid--3 result-panels">
+          <div class="result-panel">
+            <h3 data-i18n="ocr">OCR</h3>
+            <p class="muted" data-i18n="detectedText">Detected Text</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+          </div>
+          <div class="result-panel">
+            <h3 data-i18n="barcode">Barcode</h3>
+            <p class="muted" data-i18n="detectedBarcode">Detected Barcode</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+          </div>
+          <div class="result-panel">
+            <h3 data-i18n="matchingCandidates">Matching Candidates</h3>
+            <p class="muted" data-i18n="similarity">Similarity</p>
+            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
+          </div>
+        </div>
+        <p class="card__footnote" data-i18n="similarityDisclaimer">
+          Similarity values represent retrieval evidence. Final match decisions are made by the
+          Urban Intelligence Backend using multimodal evidence and governed decision rules.
+        </p>
+      </section>
+
+      <section class="card" id="governance-card">
+        <h2 data-i18n="trustedAi">Trusted AI</h2>
+        <ul class="checklist">
+          <li>✓ <span data-i18n="gTenant">Tenant isolated</span></li>
+          <li>✓ <span data-i18n="gSite">Site scoped</span></li>
+          <li>✓ <span data-i18n="gAuth">Signed service authentication</span></li>
+          <li>✓ <span data-i18n="gTrace">Request traceability</span></li>
+          <li>✓ <span data-i18n="gProvenance">Model provenance</span></li>
+          <li>✓ <span data-i18n="gDemo">Synthetic demo-data separation</span></li>
+          <li>✓ <span data-i18n="gEmbeddings">No raw embeddings exposed</span></li>
+          <li>✓ <span data-i18n="gHuman">Human-in-the-loop decision</span></li>
+        </ul>
+      </section>
+
+      <section class="card docs-card">
+        <h2 data-i18n="apiDocumentation">API Documentation</h2>
+        <div class="doc-links">
+          <a class="btn" href="/docs" data-i18n="openSwagger">Open Swagger</a>
+          <a class="btn btn--ghost" href="/openapi.json" data-i18n="openApiSpec">OpenAPI Specification</a>
+          <a class="btn btn--ghost" href="/health/ready" data-i18n="systemReadiness">System Readiness</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="page-footer">
+      <span data-i18n="footerNote">Demonstration console — synthetic festival data only.</span>
+    </footer>
+
+    <script src="/static/clip-console.js"></script>
+  </body>
+</html>
