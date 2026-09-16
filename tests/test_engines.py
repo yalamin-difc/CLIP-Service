@@ -14,6 +14,28 @@ from unittest.mock import patch
 import numpy as np
 
 
+class _FakePoolerOutput:
+    """Stands in for a transformers ModelOutput such as
+    BaseModelOutputWithPooling: get_text_features()/get_image_features()
+    on some transformers versions return this instead of a raw tensor (the
+    real failure observed on the Azure canary), and the projected
+    embedding lives in `.pooler_output`."""
+
+    def __init__(self, pooler_output, last_hidden_state=None):
+        self.pooler_output = pooler_output
+        # A distractor: _feature_tensor must never fall back to this when
+        # a real pooler_output is present.
+        self.last_hidden_state = last_hidden_state if last_hidden_state is not None else np.zeros((1, 3, 8))
+
+
+class _FakeUnusableOutput:
+    """No pooler_output, and not tensor-like -- the negative case."""
+
+    def __init__(self):
+        self.pooler_output = None
+        self.last_hidden_state = np.zeros((1, 3, 8))
+
+
 class _FakeTorchModule(types.ModuleType):
     """Stands in for `torch` in environments where it isn't installed (as
     in this sandbox), so siglip2_engine's `with torch.inference_mode():`
@@ -178,6 +200,130 @@ class Siglip2EngineTests(unittest.TestCase):
             self.assertEqual(self.engine._text_max_tokens(), 64)
             vector = self.engine.encode_text("hello")
             self.assertEqual(len(vector), 4)
+
+    def _install_model_returning(self, *, image_return=None, text_return=None):
+        """Like _load_with_fakes, but installs the model's raw return value
+        verbatim instead of computing it from a plain vector list -- used
+        to exercise the raw-tensor vs. ModelOutput/pooler_output branches
+        of _feature_tensor directly."""
+
+        class FakeTokenizer:
+            model_max_length = 64
+
+        class FakeImageProcessor:
+            def to_dict(self):
+                return {"size": {"height": 384, "width": 384}, "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5]}
+
+        class FakeProcessor:
+            tokenizer = FakeTokenizer()
+            image_processor = FakeImageProcessor()
+
+            def __call__(self, images=None, text=None, **kwargs):
+                if images is not None:
+                    return {"pixel_values": np.zeros((1, 3, 384, 384))}
+                return {"input_ids": np.zeros((1, kwargs.get("max_length", 64)))}
+
+        class FakeModel:
+            def get_image_features(self, **inputs):
+                return image_return
+
+            def get_text_features(self, **inputs):
+                return text_return
+
+        self.engine._processor = FakeProcessor()
+        self.engine._model = FakeModel()
+
+    def _real_1152_vector(self, fill=0.0, first=3.0):
+        vector = [fill] * 1152
+        vector[0] = first
+        return vector
+
+    # -- regression tests: transformers may return a raw tensor OR a
+    # ModelOutput (e.g. BaseModelOutputWithPooling) from get_text_features/
+    # get_image_features -- both must produce a normalized 1152-D vector,
+    # and neither must ever be passed whole into NumPy (the real bug
+    # observed on the Azure canary: TypeError converting a
+    # BaseModelOutputWithPooling to float).
+    def test_case_a_text_features_raw_tensor_succeeds(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._install_model_returning(text_return=np.asarray([self._real_1152_vector()]))
+            from PIL import Image  # noqa: F401 (parity with other tests; unused here)
+
+            vector = self.engine.encode_text("black suitcase")
+            self.assertEqual(len(vector), 1152)
+            self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=5)
+
+    def test_case_b_text_features_pooler_output_object_succeeds(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            pooled = np.asarray([self._real_1152_vector(first=5.0)])
+            self._install_model_returning(text_return=_FakePoolerOutput(pooled))
+            vector = self.engine.encode_text("black suitcase")
+            self.assertEqual(len(vector), 1152)
+            self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=5)
+
+    def test_case_c_image_features_raw_tensor_succeeds(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._install_model_returning(image_return=np.asarray([self._real_1152_vector()]))
+            from PIL import Image
+
+            vector = self.engine.encode_image(Image.new("RGB", (8, 8)))
+            self.assertEqual(len(vector), 1152)
+            self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=5)
+
+    def test_case_d_image_features_pooler_output_object_succeeds(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            pooled = np.asarray([self._real_1152_vector(first=7.0)])
+            self._install_model_returning(image_return=_FakePoolerOutput(pooled))
+            from PIL import Image
+
+            vector = self.engine.encode_image(Image.new("RGB", (8, 8)))
+            self.assertEqual(len(vector), 1152)
+            self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=5)
+
+    def test_feature_tensor_raises_invalid_output_when_unusable(self):
+        with self.assertRaises(EngineUnavailableError) as ctx:
+            Siglip2Engine._feature_tensor(_FakeUnusableOutput())
+        self.assertEqual(ctx.exception.error_category, "invalid_output")
+
+    def test_feature_tensor_never_picks_arbitrary_tuple_member(self):
+        with self.assertRaises(EngineUnavailableError) as ctx:
+            Siglip2Engine._feature_tensor((np.zeros((1, 1152)), np.zeros((1, 3, 8))))
+        self.assertEqual(ctx.exception.error_category, "invalid_output")
+
+    def test_encode_text_with_unusable_output_raises_invalid_output_end_to_end(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._install_model_returning(text_return=_FakeUnusableOutput())
+            with self.assertRaises(EngineUnavailableError) as ctx:
+                self.engine.encode_text("black suitcase")
+            self.assertEqual(ctx.exception.error_category, "invalid_output")
+
+    # -- readiness semantics: ready must become true after a real,
+    # on-demand inference succeeds, even with SIGLIP2_LOAD_ON_START=false
+    # (warmup() never called) -- and must stay false until one does.
+    def test_ready_false_before_any_successful_inference(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._install_model_returning(text_return=np.asarray([self._real_1152_vector()]))
+            readiness = self.engine.readiness()
+            self.assertTrue(readiness.loaded)
+            self.assertFalse(readiness.warmup_completed)
+            self.assertFalse(readiness.ready)
+
+    def test_ready_true_after_real_inference_without_warmup(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._install_model_returning(text_return=np.asarray([self._real_1152_vector()]))
+            self.engine.encode_text("black suitcase")
+            readiness = self.engine.readiness()
+            self.assertTrue(readiness.ready)
+            # warmup_completed stays strictly about warmup()/startup, never
+            # flipped just because a normal request succeeded.
+            self.assertFalse(readiness.warmup_completed)
+
+    def test_ready_false_when_disabled_even_after_prior_success(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._install_model_returning(text_return=np.asarray([self._real_1152_vector()]))
+            self.engine.encode_text("black suitcase")
+        with patch.object(engine_config, "SIGLIP2_ENABLED", False):
+            self.assertFalse(self.engine.readiness().ready)
 
     def test_readiness_reports_disabled_engine(self):
         readiness = self.engine.readiness()

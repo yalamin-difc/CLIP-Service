@@ -59,6 +59,13 @@ class Siglip2Engine(EmbeddingEngine):
         self._preprocessing_version: Optional[str] = None
         self._load_error_category: Optional[str] = None
         self._warmup_completed = False
+        # Set the first time a real encode_image/encode_text call fully
+        # succeeds (see _normalize). Distinct from _warmup_completed, which
+        # is reserved for an explicit startup/manual warmup() call -- with
+        # SIGLIP2_LOAD_ON_START=false (the default), warmup() never runs,
+        # but the engine is still genuinely ready once a normal on-demand
+        # inference has actually worked (see readiness() below).
+        self._inference_succeeded = False
         self._inference_limiter = anyio.CapacityLimiter(1)
 
     # -- configuration -----------------------------------------------
@@ -203,6 +210,33 @@ class Siglip2Engine(EmbeddingEngine):
         # from CLIP's 77-token context -- never fall back to CLIP's constant.
         return cfg.SIGLIP2_TEXT_MAX_TOKENS
 
+    @staticmethod
+    def _feature_tensor(value: Any) -> Any:
+        """Normalize get_text_features()/get_image_features() return shapes
+        across transformers versions: some implementations return a raw
+        tensor directly; others return a ModelOutput (e.g.
+        BaseModelOutputWithPooling, observed on the Azure canary) whose
+        projected embedding lives in `.pooler_output`. This exists ONLY to
+        resolve that shape difference -- it never picks last_hidden_state
+        when a projected pooler_output exists, and it never guesses at an
+        arbitrary tuple/mapping member. Raises EngineUnavailableError
+        (error_category="invalid_output") if no usable tensor can be found,
+        rather than passing an unsupported object into NumPy."""
+        pooler_output = getattr(value, "pooler_output", None)
+        if pooler_output is not None:
+            return pooler_output
+        if isinstance(value, Mapping):
+            mapped = value.get("pooler_output")
+            if mapped is not None:
+                return mapped
+        if hasattr(value, "shape") or hasattr(value, "detach") or hasattr(value, "numpy"):
+            # Already a tensor/ndarray -- return unchanged.
+            return value
+        raise EngineUnavailableError(
+            "SigLIP2 returned no usable pooled feature tensor (no pooler_output and not a tensor)",
+            error_category="invalid_output",
+        )
+
     def _normalize(self, features: Any) -> List[float]:
         array = features
         if hasattr(array, "detach"):
@@ -230,6 +264,7 @@ class Siglip2Engine(EmbeddingEngine):
                 f"expected dimension {self.expected_dimension}",
                 error_category="dimension_mismatch",
             )
+        self._inference_succeeded = True
         return [float(value) for value in normalized]
 
     def _move_inputs(self, inputs: Mapping[str, Any]) -> Dict[str, Any]:
@@ -244,7 +279,7 @@ class Siglip2Engine(EmbeddingEngine):
 
             inputs = self._move_inputs(self._processor(images=image, return_tensors="pt"))
             with torch.inference_mode():
-                features = self._model.get_image_features(**inputs)
+                features = self._feature_tensor(self._model.get_image_features(**inputs))
         except EngineUnavailableError:
             raise
         except Exception as exc:
@@ -268,7 +303,7 @@ class Siglip2Engine(EmbeddingEngine):
                 )
             )
             with torch.inference_mode():
-                features = self._model.get_text_features(**inputs)
+                features = self._feature_tensor(self._model.get_text_features(**inputs))
         except EngineUnavailableError:
             raise
         except Exception as exc:
@@ -309,11 +344,25 @@ class Siglip2Engine(EmbeddingEngine):
     # -- observability -----------------------------------------------
     def readiness(self) -> EngineReadiness:
         loaded = self._model is not None and self._processor is not None
+        # "ready" means: enabled, loaded, no current fatal load error, and
+        # at least one successful inference -- either an explicit startup/
+        # manual warmup() (_warmup_completed) or a real on-demand encode
+        # that actually completed (_inference_succeeded). With
+        # SIGLIP2_LOAD_ON_START=false (the default), warmup() never runs,
+        # so without _inference_succeeded this engine would misleadingly
+        # report ready=false forever even after serving real traffic
+        # successfully.
+        ready = (
+            self.is_enabled()
+            and loaded
+            and self._load_error_category is None
+            and (self._warmup_completed or self._inference_succeeded)
+        )
         return EngineReadiness(
             engine=self.engine_id,
             enabled=self.is_enabled(),
             loaded=loaded,
-            ready=loaded and self._warmup_completed,
+            ready=ready,
             warmup_completed=self._warmup_completed,
             device=self.device,
             expected_embedding_dimension=self.expected_dimension,
