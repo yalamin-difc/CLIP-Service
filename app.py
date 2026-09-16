@@ -2898,3 +2898,14 @@ async def match(request: Request):
 from v2_router import router as v2_router  # noqa: E402
 
 app.include_router(v2_router)
+
+# P14: the public Dubai AI Festival live demo facade (GET /demo/status,
+# POST /demo/match, GET /demo/assets/candidates/{filename}). Always
+# mounted, exactly like v2_router above -- every handler in demo_router.py
+# fails closed at call time via demo_config.demo_config_ready(), so with
+# DEMO_FACADE_ENABLED unset/false (the default) every /demo/* route
+# behaves as if it were never mounted. This never touches, weakens, or
+# bypasses authentication on /items, /match, /v2/*, or /metrics.
+from demo_router import router as demo_router  # noqa: E402
+
+app.include_router(demo_router)
