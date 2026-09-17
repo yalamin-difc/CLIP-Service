@@ -23,6 +23,15 @@ console's architecture, security model, and limitations.
 - [`docs/DEPENDENCY_MANIFEST.md`](docs/DEPENDENCY_MANIFEST.md) — pinned runtime dependencies
 - [`docs/BENCHMARK_REPORT_TEMPLATE.md`](docs/BENCHMARK_REPORT_TEMPLATE.md) — latency/throughput benchmark template
 - [`README-DEPLOY-GPU-VM.md`](README-DEPLOY-GPU-VM.md) — GPU VM deployment notes
+- [`docs/P13_SIGLIP2_AB_IMPLEMENTATION.md`](docs/P13_SIGLIP2_AB_IMPLEMENTATION.md) — SigLIP2 alongside CLIP: dual embeddings, the `/v2` API, A/B testing, rollback
+
+## SigLIP2 / A/B testing (experimental, disabled by default)
+
+This service also supports an experimental `google/siglip2-so400m-patch14-384` engine
+(`siglip2_v1`) alongside the production CLIP engine (`clip_v1`), for internal evaluation via a
+new `/v2/*` API surface. It is fully disabled by default (`SIGLIP2_ENABLED=false`,
+`AB_TEST_ENABLED=false`, `AB_UI_ENABLED=false`) and never changes any legacy endpoint's
+behaviour. See [`docs/P13_SIGLIP2_AB_IMPLEMENTATION.md`](docs/P13_SIGLIP2_AB_IMPLEMENTATION.md).
 
 ## Development
 

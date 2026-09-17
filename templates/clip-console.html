@@ -3,14 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CLIP AI Engine — Al-Amen Technology</title>
+    <title>Multimodal AL Engine — Urban Intelligence</title>
     <link rel="stylesheet" href="/static/clip-console.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="topbar__brand">
-        <span class="topbar__org">AL-AMEN TECHNOLOGY</span>
-        <span class="topbar__product" data-i18n="title">CLIP AI Engine</span>
+        <span class="topbar__org" data-i18n="title">Multimodal AL Engine</span>
+        <span class="topbar__tagline" data-i18n="orgTagline">Urban Intelligence AI Lab</span>
       </div>
       <div class="topbar__actions">
         <span class="lang-toggle" role="group" aria-label="Language">
@@ -22,23 +22,175 @@
     </header>
 
     <div class="festival-banner">
-      <span data-i18n="festivalBanner">Dubai AI Festival 2026 — Demonstration Environment</span>
+      <span data-i18n="festivalBanner">Dubai AI Festival 2026 — Live Demonstration</span>
       <span class="demo-pill" data-i18n="demoDataPill">DEMO DATA · بيانات تجريبية</span>
     </div>
 
     <main class="page">
       <section class="hero">
-        <h1 data-i18n="title">CLIP AI Engine</h1>
-        <p class="hero__subtitle">
-          <span data-i18n="subtitleLine1">Multimodal Intelligence for Lost &amp; Found</span><br />
-          <span data-i18n="subtitleLine2">Urban Intelligence Platform</span>
+        <h1 data-i18n="heroTitle">Multimodal Asset Recovery AI</h1>
+        <p class="hero__subtitle" data-i18n="heroSubtitle">
+          Visual + multilingual intelligence for lost &amp; found and urban asset recovery.
         </p>
+        <p class="hero__models mono" dir="ltr">CLIP ViT-B/32 | SigLIP2 So400M</p>
+        <div class="hero__model-meta" dir="ltr">
+          <span class="hero__model-meta-col">
+            <strong>512-D</strong>
+            <span data-i18n="productionBaseline">Production Baseline</span>
+          </span>
+          <span class="hero__model-meta-col">
+            <strong>1152-D</strong>
+            <span data-i18n="experimentalUncalibrated">Experimental / Uncalibrated</span>
+          </span>
+        </div>
         <p class="hero__story" data-i18n="festivalStory">
-          CLIP is one intelligence layer of Al-Amen Technology's AI-powered Lost &amp; Found / Urban
-          Intelligence Platform. It converts visual and textual evidence into comparable
-          representations, retrieves relevant candidates, and combines with OCR and barcode signals.
-          Final match decisions remain governed by the Urban Intelligence Backend and human review.
+          The Urban Intelligence Platform uses multiple multimodal AI models, including CLIP and
+          SigLIP2, to convert visual and textual evidence into model-specific representations,
+          retrieve and rank relevant lost-and-found and asset-recovery candidates, and enrich
+          results with OCR, barcode, and contextual signals. CLIP and SigLIP2 operate in separate
+          embedding spaces -- their retrieval evidence feeds the Urban Intelligence workflow,
+          while final recovery decisions remain subject to governed backend rules and human
+          verification.
         </p>
+      </section>
+
+      <section class="card card--demo" id="live-demo-card">
+        <h2 data-i18n="liveDemoTitle">Live AI Demo</h2>
+        <p class="analysis-unavailable" id="demo-unavailable-notice" data-i18n="demoUnavailableNotice" hidden>
+          The live demo facade is not enabled in this environment. Ask the Urban Intelligence team to
+          set DEMO_FACADE_ENABLED=true on this canary to turn it on.
+        </p>
+        <div id="demo-interactive">
+          <div class="mode-tabs" role="tablist" aria-label="Model mode">
+            <button type="button" class="mode-tab is-active" id="mode-tab-clip" data-mode="clip" role="tab" aria-selected="true" data-i18n="modeClip">CLIP</button>
+            <button type="button" class="mode-tab" id="mode-tab-siglip2" data-mode="siglip2" role="tab" aria-selected="false" data-i18n="modeSiglip2">SigLIP2</button>
+            <button type="button" class="mode-tab" id="mode-tab-compare" data-mode="compare" role="tab" aria-selected="false" data-i18n="modeCompare">Compare</button>
+          </div>
+
+          <div class="upload-shell upload-shell--active" id="demo-upload-shell">
+            <label class="upload-drop" id="demo-upload-drop" for="demo-upload-input">
+              <span data-i18n="demoUploadLabel">Drag &amp; drop an image, or click to choose a file</span>
+              <input type="file" id="demo-upload-input" accept="image/jpeg,image/png,image/webp" />
+            </label>
+            <div class="preview-box" id="demo-preview-box">
+              <img id="demo-preview-img" alt="" hidden />
+              <span id="demo-preview-empty" data-i18n="previewPlaceholder">No image selected</span>
+            </div>
+          </div>
+
+          <label class="demo-text-label" for="demo-text-input" data-i18n="demoTextLabel">
+            Optional description (English, Arabic, or mixed)
+          </label>
+          <textarea
+            id="demo-text-input"
+            class="demo-textarea"
+            rows="2"
+            data-i18n-placeholder="demoTextPlaceholder"
+            placeholder="e.g. black suitcase with a red ribbon on the handle"
+          ></textarea>
+
+          <button type="button" class="btn btn--analyze" id="demo-analyze-btn" disabled data-i18n="analyzeButton">
+            Analyze Item
+          </button>
+
+          <p class="demo-processing" id="demo-processing" hidden>
+            <span class="spinner" aria-hidden="true"></span>
+            <span id="demo-processing-text" data-i18n="analyzingText">Analyzing multimodal evidence…</span>
+          </p>
+
+          <p class="demo-error" id="demo-error" role="alert" hidden></p>
+
+          <div id="demo-results" hidden>
+            <div id="demo-results-single" hidden>
+              <div class="candidate-list" id="demo-single-candidates"></div>
+            </div>
+            <div id="demo-results-compare" hidden>
+              <div class="grid grid--2 compare-columns">
+                <div class="compare-column" id="compare-col-clip">
+                  <h3>CLIP ViT-B/32</h3>
+                  <p class="engine-status" id="compare-clip-status">—</p>
+                  <p class="engine-latency" id="compare-clip-latency">—</p>
+                  <div class="candidate-list" id="compare-clip-candidates"></div>
+                </div>
+                <div class="compare-column" id="compare-col-siglip2">
+                  <h3>
+                    SigLIP2 So400M
+                    <span class="badge badge--experimental" data-i18n="experimentalBadge">Experimental / Uncalibrated</span>
+                  </h3>
+                  <p class="engine-status" id="compare-siglip2-status">—</p>
+                  <p class="engine-latency" id="compare-siglip2-latency">—</p>
+                  <div class="candidate-list" id="compare-siglip2-candidates"></div>
+                </div>
+              </div>
+              <div class="compare-summary" id="compare-summary">
+                <span id="compare-same-top1">—</span>
+                <span id="compare-overlap">—</span>
+                <span id="compare-latency-diff">—</span>
+              </div>
+            </div>
+          </div>
+
+          <p class="card__footnote" data-i18n="demoEvidenceNote">
+            Ranked candidates below are retrieval evidence (OCR/barcode overlap, when available) --
+            not a confirmed match.
+          </p>
+          <p class="calibration-tooltip" data-i18n="calibrationTooltip">
+            Similarity values are retrieval signals and are not ownership probabilities. Scores from
+            different AI models are not directly comparable.
+          </p>
+          <p class="human-review-banner" data-i18n="humanReviewBanner">
+            AI-assisted candidate retrieval — human verification required.
+          </p>
+        </div>
+      </section>
+
+      <section class="grid grid--2" id="model-status-cards">
+        <div class="card model-card" id="model-card-clip">
+          <h3>CLIP ViT-B/32</h3>
+          <dl class="kv model-card__kv">
+            <div class="kv__row">
+              <dt data-i18n="modelIdLabel">Model</dt>
+              <dd class="mono" dir="ltr">openai/clip-vit-base-patch32</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="embeddingLabel">Embedding</dt>
+              <dd id="model-card-clip-dim">512-D</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="roleLabel">Role</dt>
+              <dd data-i18n="productionBaseline">Production Baseline</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="statusLabelShort">Status</dt>
+              <dd class="model-card__status" id="model-card-clip-status" data-i18n="unavailable">Unavailable</dd>
+            </div>
+          </dl>
+        </div>
+        <div class="card model-card" id="model-card-siglip2">
+          <h3>SigLIP2 So400M</h3>
+          <dl class="kv model-card__kv">
+            <div class="kv__row">
+              <dt data-i18n="modelIdLabel">Model</dt>
+              <dd class="mono" dir="ltr">google/siglip2-so400m-patch14-384</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="embeddingLabel">Embedding</dt>
+              <dd id="model-card-siglip2-dim">1152-D</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="roleLabel">Role</dt>
+              <dd data-i18n="siglip2Role">Advanced Multimodal Evaluation Engine</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="statusLabelShort">Status</dt>
+              <dd class="model-card__status" id="model-card-siglip2-status" data-i18n="unavailable">Unavailable</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="calibrationLabel">Calibration</dt>
+              <dd data-i18n="experimentalUncalibrated">Experimental / Uncalibrated</dd>
+            </div>
+          </dl>
+        </div>
       </section>
 
       <section class="grid grid--2">
@@ -109,60 +261,23 @@
       <section class="card">
         <h2 data-i18n="pipelineTitle">AI Pipeline</h2>
         <ol class="pipeline">
-          <li><span data-i18n="pStepImage">Image</span></li>
+          <li><span data-i18n="pStepInput">Image / Text</span></li>
           <li><span data-i18n="pStepPreprocess">Preprocessing</span></li>
-          <li><span>CLIP ViT-B/32</span></li>
-          <li><span id="pipeline-vector" data-i18n="pStepVector">Vector representation</span></li>
-          <li><span data-i18n="pStepRetrieval">Authorized corpus retrieval</span></li>
-          <li><span data-i18n="pStepSignals">OCR + barcode signals</span></li>
+          <li><span dir="ltr">CLIP / SigLIP2</span></li>
+          <li><span id="pipeline-vector" data-i18n="pStepVector">Model-specific embeddings</span></li>
+          <li><span data-i18n="pStepRetrieval">Tenant/site isolated retrieval</span></li>
+          <li><span data-i18n="pStepSignals">OCR + Barcode + contextual signals</span></li>
           <li><span data-i18n="pStepRanked">Ranked candidates</span></li>
-          <li><span data-i18n="pStepFusion">Backend multimodal fusion</span></li>
-          <li><span data-i18n="pStepReview">Human review</span></li>
+          <li><span data-i18n="pStepFusion">Urban Intelligence fusion</span></li>
+          <li><span data-i18n="pStepReview">Human verification</span></li>
         </ol>
-      </section>
-
-      <section class="card" id="analysis-card">
-        <h2 data-i18n="imageAnalysis">Image Analysis</h2>
-        <p class="analysis-unavailable" data-i18n="analysisUnavailableNotice">
-          Live image analysis is not enabled in this public demonstration console. Protected CLIP
-          operations require a signed internal service identity that can never be issued to a
-          browser. See the API documentation below, or ask the Urban Intelligence Backend team
-          about a demo-safe server-side facade.
-        </p>
-        <div class="upload-shell" aria-disabled="true">
-          <label class="upload-drop" id="upload-drop" for="upload-input">
-            <span data-i18n="uploadLabel">Upload Lost/Found Item Image</span>
-            <input type="file" id="upload-input" accept="image/jpeg,image/png,image/webp" disabled />
-          </label>
-          <div class="preview-box" id="preview-box">
-            <img id="preview-img" alt="" hidden />
-            <span id="preview-empty" data-i18n="previewPlaceholder">No image selected</span>
-          </div>
-        </div>
-
-        <div class="grid grid--3 result-panels">
-          <div class="result-panel">
-            <h3 data-i18n="ocr">OCR</h3>
-            <p class="muted" data-i18n="detectedText">Detected Text</p>
-            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
-          </div>
-          <div class="result-panel">
-            <h3 data-i18n="barcode">Barcode</h3>
-            <p class="muted" data-i18n="detectedBarcode">Detected Barcode</p>
-            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
-          </div>
-          <div class="result-panel">
-            <h3 data-i18n="matchingCandidates">Matching Candidates</h3>
-            <p class="muted" data-i18n="similarity">Similarity</p>
-            <p class="placeholder" data-i18n="unavailable">Unavailable</p>
-          </div>
-        </div>
-        <p class="card__footnote" data-i18n="similarityDisclaimer">
-          Similarity values represent retrieval evidence. Final match decisions are made by the
-          Urban Intelligence Backend using multimodal evidence and governed decision rules.
+        <p class="card__footnote" data-i18n="pipelineIsolationNote">
+          CLIP 512-D and SigLIP2 1152-D embeddings are maintained and searched in separate
+          model-specific vector spaces.
         </p>
       </section>
 
+      {{AB_COMPARISON_SECTION}}
       <section class="card" id="governance-card">
         <h2 data-i18n="trustedAi">Trusted AI</h2>
         <ul class="checklist">
@@ -174,6 +289,8 @@
           <li>✓ <span data-i18n="gDemo">Synthetic demo-data separation</span></li>
           <li>✓ <span data-i18n="gEmbeddings">No raw embeddings exposed</span></li>
           <li>✓ <span data-i18n="gHuman">Human-in-the-loop decision</span></li>
+          <li>✓ <span data-i18n="gNoPii">No PII required for model demonstration</span></li>
+          <li>✓ <span data-i18n="gProdIsolated">Production data inaccessible from demo facade</span></li>
         </ul>
       </section>
 
