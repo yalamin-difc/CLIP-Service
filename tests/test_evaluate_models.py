@@ -8,11 +8,13 @@ import json
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+import app as clip_service  # noqa: E402
 import evaluate_models as harness  # noqa: E402
 
 MANIFEST_PATH = REPO_ROOT / "docs" / "eval" / "synthetic_eval_manifest.json"
@@ -133,11 +135,17 @@ class RealEngineSkipTests(unittest.TestCase):
         self.assertNotIn("perQuery", result)
 
     def test_engine_with_unavailable_dependencies_is_skipped_not_scored(self):
-        # clip_v1.is_enabled() is always True, but this sandbox has no
-        # torch/transformers installed, so real encoding fails -- exactly
-        # the "cannot actually run" case this harness must never paper over.
+        # clip_v1.is_enabled() is always True, so this forces the "loads
+        # but can't actually run" case deterministically -- whether or not
+        # torch/transformers happen to be installed in the environment
+        # this test runs in (they are in CI, not in every dev sandbox) --
+        # exactly the "cannot actually run" case this harness must never
+        # paper over. Same load_model() patch technique used throughout
+        # this suite (see tests/test_app.py) to force a real, not
+        # environment-dependent, failure.
         manifest = _tiny_manifest()
-        result = harness.evaluate_with_engine("clip_v1", manifest)
+        with patch.object(clip_service, "load_model", side_effect=RuntimeError("forced failure for this test")):
+            result = harness.evaluate_with_engine("clip_v1", manifest)
         self.assertEqual(result["status"], "skipped")
         self.assertIn("reason", result)
         self.assertNotIn("aggregate", result)
