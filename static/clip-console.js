@@ -1,4 +1,4 @@
-/* CLIP AI Engine festival console -- vanilla JS only.
+/* Multimodal AL Engine festival console -- vanilla JS only.
  *
  * This script NEVER creates or signs a service JWT, never reads
  * INTERNAL_JWT_SECRET or MONGODB_URI (they do not exist in the browser),
@@ -15,17 +15,19 @@
 
   var STRINGS = {
     en: {
-      title: "CLIP AI Engine",
+      title: "Multimodal AL Engine",
       subtitleLine1: "Multimodal Intelligence for Lost & Found",
       subtitleLine2: "Urban Intelligence Platform",
       festivalBanner: "Dubai AI Festival 2026 — Demonstration Environment",
       demoDataPill: "DEMO DATA",
       festivalStory:
-        "CLIP is one intelligence layer of Al-Amen Technology's AI-powered Lost & Found / " +
-        "Urban Intelligence Platform. It converts visual and textual evidence into comparable " +
-        "representations, retrieves relevant candidates, and combines with OCR and barcode " +
-        "signals. Final match decisions remain governed by the Urban Intelligence Backend and " +
-        "human review.",
+        "The Urban Intelligence Platform uses multiple multimodal AI models, including CLIP and " +
+        "SigLIP2, to convert visual and textual evidence into model-specific representations, " +
+        "retrieve and rank relevant lost-and-found and asset-recovery candidates, and enrich " +
+        "results with OCR, barcode, and contextual signals. CLIP and SigLIP2 operate in separate " +
+        "embedding spaces -- their retrieval evidence feeds the Urban Intelligence workflow, " +
+        "while final recovery decisions remain subject to governed backend rules and human " +
+        "verification.",
       serviceStatus: "Service Status",
       model: "Model",
       ocr: "OCR",
@@ -50,7 +52,7 @@
       pStepPreprocess: "Preprocessing",
       pStepVector: "512-dimensional representation",
       pStepRetrieval: "Authorized corpus retrieval",
-      pStepSignals: "OCR + barcode signals",
+      pStepSignals: "OCR + Barcode + contextual signals",
       pStepRanked: "Ranked candidates",
       pStepFusion: "Backend multimodal fusion",
       pStepReview: "Human review",
@@ -99,7 +101,7 @@
         "probability. A higher number never means a more certain match.",
       orgTagline: "Urban Intelligence AI Lab",
       heroTitle: "Multimodal Asset Recovery AI",
-      heroSubtitle: "AI-powered visual and multilingual retrieval for lost & found and urban asset recovery.",
+      heroSubtitle: "Visual + multilingual intelligence for lost & found and urban asset recovery.",
       liveDemoTitle: "Live AI Demo",
       demoUnavailableNotice:
         "The live demo facade is not enabled in this environment. Ask the Urban Intelligence team " +
@@ -116,18 +118,24 @@
         "Ranked candidates below are retrieval evidence (OCR/barcode overlap, when available) -- " +
         "not a confirmed match.",
       calibrationTooltip:
-        "Similarity values are retrieval signals and are not ownership probabilities. Scores from " +
+        "Similarity scores are retrieval signals, not ownership probabilities. Scores from " +
         "different AI models are not directly comparable.",
       humanReviewBanner: "AI-assisted candidate retrieval — human verification required.",
       experimentalBadge: "Experimental / Uncalibrated",
-      productionBaseline: "Production baseline",
+      productionBaseline: "Production Baseline",
       experimentalUncalibrated: "Experimental / Uncalibrated",
       pStepInput: "Image / Text",
       pipelineIsolationNote:
-        "CLIP's 512-D and SigLIP2's 1152-D embeddings are never stored or searched in the same " +
-        "index -- each engine keeps its own model-specific representation and retrieval index.",
+        "CLIP 512-D and SigLIP2 1152-D embeddings are maintained and searched in separate " +
+        "model-specific vector spaces.",
       gNoPii: "No PII required for model demonstration",
       gProdIsolated: "Production data inaccessible from demo facade",
+      modelIdLabel: "Model",
+      embeddingLabel: "Embedding",
+      roleLabel: "Role",
+      statusLabelShort: "Status",
+      calibrationLabel: "Calibration",
+      siglip2Role: "Advanced Multimodal Evaluation Engine",
       errorRateLimited: "Too many requests -- please wait a moment and try again.",
       errorEngineUnavailable: "This AI engine is temporarily unavailable. Please try again shortly.",
       errorTimeout: "The request took too long and timed out. Please try again.",
@@ -147,17 +155,18 @@
       notReadyLabel: "Not ready",
     },
     ar: {
-      title: "محرك CLIP للذكاء الاصطناعي",
+      title: "محرك الذكاء متعدد الوسائط",
       subtitleLine1: "ذكاء متعدد الوسائط للمفقودات والموجودات",
       subtitleLine2: "منصة الذكاء الحضري",
       festivalBanner: "مهرجان دبي للذكاء الاصطناعي 2026 — بيئة تجريبية",
       demoDataPill: "بيانات تجريبية",
       festivalStory:
-        "يُعد CLIP إحدى طبقات الذكاء في منصة الذكاء الحضري / المفقودات والموجودات التابعة " +
-        "لشركة الأمين للتقنية. يحوّل الأدلة البصرية والنصية إلى تمثيلات قابلة للمقارنة، " +
-        "ويسترجع المرشحين ذوي الصلة، ويجمعها مع إشارات التعرف الضوئي على الحروف والرموز " +
-        "الشريطية. تبقى قرارات المطابقة النهائية خاضعة لحوكمة الخلفية البرمجية للذكاء " +
-        "الحضري وللمراجعة البشرية.",
+        "تستخدم منصة الذكاء الحضري عدة نماذج ذكاء اصطناعي متعددة الوسائط، منها CLIP وSigLIP2، " +
+        "لتحويل الأدلة البصرية والنصية إلى تمثيلات خاصة بكل نموذج، واسترجاع وترتيب المرشحين " +
+        "ذوي الصلة بالمفقودات والموجودات واسترداد الأصول، وإثراء النتائج بإشارات التعرف الضوئي " +
+        "والرموز الشريطية والسياق. يعمل كل من CLIP وSigLIP2 في فضاء تمثيل متجهي منفصل خاص به -- " +
+        "تُستخدم أدلة الاسترجاع الخاصة بهما ضمن سير عمل الذكاء الحضري، بينما تبقى قرارات " +
+        "الاسترداد النهائية خاضعة لقواعد الخلفية البرمجية المحوكمة وللمراجعة البشرية.",
       serviceStatus: "حالة الخدمة",
       model: "النموذج",
       ocr: "التعرف الضوئي على الحروف",
@@ -182,7 +191,7 @@
       pStepPreprocess: "المعالجة المسبقة",
       pStepVector: "تمثيل متجهي بـ 512 بُعدًا",
       pStepRetrieval: "استرجاع من المجموعة المصرّح بها",
-      pStepSignals: "إشارات التعرف الضوئي والرمز الشريطي",
+      pStepSignals: "إشارات التعرف الضوئي والرمز الشريطي والسياق",
       pStepRanked: "مرشحون مرتّبون",
       pStepFusion: "دمج متعدد الوسائط في الخلفية البرمجية",
       pStepReview: "مراجعة بشرية",
@@ -230,8 +239,8 @@
         "درجات CLIP أو مع بعضها البعض، ولا تمثل درجة أي من المحركين احتمال ملكية. الدرجة " +
         "الأعلى لا تعني أبدًا مطابقة أكثر يقينًا.",
       orgTagline: "مختبر الذكاء الاصطناعي للذكاء الحضري",
-      heroTitle: "ذكاء اصطناعي متعدد الوسائط لاسترداد الأصول",
-      heroSubtitle: "استرجاع بصري ومتعدد اللغات مدعوم بالذكاء الاصطناعي للمفقودات والموجودات واسترداد الأصول الحضرية.",
+      heroTitle: "الذكاء الاصطناعي متعدد الوسائط لاستعادة الأصول",
+      heroSubtitle: "ذكاء بصري ومتعدد اللغات للمفقودات والموجودات واسترداد الأصول الحضرية.",
       liveDemoTitle: "عرض الذكاء الاصطناعي المباشر",
       demoUnavailableNotice:
         "واجهة العرض المباشر غير مفعّلة في هذه البيئة. تواصل مع فريق الذكاء الحضري لتفعيل " +
@@ -248,7 +257,7 @@
         "المرشحون المرتبون أدناه هم أدلة استرجاع (تداخل التعرف الضوئي/الرمز الشريطي عند توفره) -- " +
         "وليسوا مطابقة مؤكدة.",
       calibrationTooltip:
-        "قيم التشابه هي إشارات استرجاع وليست احتمالات ملكية. الدرجات من نماذج ذكاء اصطناعي " +
+        "درجات التشابه هي إشارات استرجاع وليست احتمالات ملكية. الدرجات من نماذج ذكاء اصطناعي " +
         "مختلفة غير قابلة للمقارنة المباشرة.",
       humanReviewBanner: "استرجاع مرشحين بمساعدة الذكاء الاصطناعي — يتطلب التحقق البشري.",
       experimentalBadge: "تجريبي / غير معاير",
@@ -256,10 +265,16 @@
       experimentalUncalibrated: "تجريبي / غير معاير",
       pStepInput: "صورة / نص",
       pipelineIsolationNote:
-        "تمثيلات CLIP ذات 512 بُعدًا وSigLIP2 ذات 1152 بُعدًا لا تُخزَّن أو تُبحث أبدًا في نفس " +
-        "الفهرس -- يحتفظ كل محرك بتمثيله وفهرس الاسترجاع الخاص به.",
+        "تُحفظ تمثيلات CLIP ذات 512 بُعدًا وSigLIP2 ذات 1152 بُعدًا وتُبحث في فضاءات متجهية " +
+        "منفصلة خاصة بكل نموذج.",
       gNoPii: "لا حاجة لبيانات شخصية لعرض النموذج",
       gProdIsolated: "بيانات الإنتاج غير قابلة للوصول من واجهة العرض التجريبي",
+      modelIdLabel: "النموذج",
+      embeddingLabel: "التمثيل المتجهي",
+      roleLabel: "الدور",
+      statusLabelShort: "الحالة",
+      calibrationLabel: "المعايرة",
+      siglip2Role: "محرك تقييم متقدم متعدد الوسائط",
       errorRateLimited: "طلبات كثيرة جدًا -- يرجى الانتظار قليلاً والمحاولة مرة أخرى.",
       errorEngineUnavailable: "محرك الذكاء الاصطناعي هذا غير متاح مؤقتًا. يرجى المحاولة لاحقًا.",
       errorTimeout: "استغرق الطلب وقتًا طويلاً وانتهت مهلته. يرجى المحاولة مرة أخرى.",

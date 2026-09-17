@@ -3,15 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CLIP AI Engine — Al-Amen Technology</title>
+    <title>Multimodal AL Engine — Urban Intelligence</title>
     <link rel="stylesheet" href="/static/clip-console.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="topbar__brand">
-        <span class="topbar__org">AL-AMEN TECHNOLOGY</span>
+        <span class="topbar__org" data-i18n="title">Multimodal AL Engine</span>
         <span class="topbar__tagline" data-i18n="orgTagline">Urban Intelligence AI Lab</span>
-        <span class="topbar__product" data-i18n="title">CLIP AI Engine</span>
       </div>
       <div class="topbar__actions">
         <span class="lang-toggle" role="group" aria-label="Language">
@@ -31,15 +30,27 @@
       <section class="hero">
         <h1 data-i18n="heroTitle">Multimodal Asset Recovery AI</h1>
         <p class="hero__subtitle" data-i18n="heroSubtitle">
-          AI-powered visual and multilingual retrieval for lost &amp; found and urban asset recovery.
+          Visual + multilingual intelligence for lost &amp; found and urban asset recovery.
         </p>
         <p class="hero__models mono" dir="ltr">CLIP ViT-B/32 | SigLIP2 So400M</p>
+        <div class="hero__model-meta" dir="ltr">
+          <span class="hero__model-meta-col">
+            <strong>512-D</strong>
+            <span data-i18n="productionBaseline">Production Baseline</span>
+          </span>
+          <span class="hero__model-meta-col">
+            <strong>1152-D</strong>
+            <span data-i18n="experimentalUncalibrated">Experimental / Uncalibrated</span>
+          </span>
+        </div>
         <p class="hero__story" data-i18n="festivalStory">
-          Al-Amen Technology's Urban Intelligence platform runs two AI engines side by side on this
-          festival canary -- CLIP ViT-B/32 (production baseline) and SigLIP2 So400M (experimental) --
-          converting visual and textual evidence into comparable, model-specific representations,
-          retrieving relevant candidates, and combining them with OCR and barcode signals. Final match
-          decisions remain governed by the Urban Intelligence Backend and human review.
+          The Urban Intelligence Platform uses multiple multimodal AI models, including CLIP and
+          SigLIP2, to convert visual and textual evidence into model-specific representations,
+          retrieve and rank relevant lost-and-found and asset-recovery candidates, and enrich
+          results with OCR, barcode, and contextual signals. CLIP and SigLIP2 operate in separate
+          embedding spaces -- their retrieval evidence feeds the Urban Intelligence workflow,
+          while final recovery decisions remain subject to governed backend rules and human
+          verification.
         </p>
       </section>
 
@@ -136,15 +147,49 @@
       <section class="grid grid--2" id="model-status-cards">
         <div class="card model-card" id="model-card-clip">
           <h3>CLIP ViT-B/32</h3>
-          <p class="model-card__status" id="model-card-clip-status" data-i18n="unavailable">Unavailable</p>
-          <p class="model-card__dim" id="model-card-clip-dim">512-D</p>
-          <p class="model-card__tag" data-i18n="productionBaseline">Production baseline</p>
+          <dl class="kv model-card__kv">
+            <div class="kv__row">
+              <dt data-i18n="modelIdLabel">Model</dt>
+              <dd class="mono" dir="ltr">openai/clip-vit-base-patch32</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="embeddingLabel">Embedding</dt>
+              <dd id="model-card-clip-dim">512-D</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="roleLabel">Role</dt>
+              <dd data-i18n="productionBaseline">Production Baseline</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="statusLabelShort">Status</dt>
+              <dd class="model-card__status" id="model-card-clip-status" data-i18n="unavailable">Unavailable</dd>
+            </div>
+          </dl>
         </div>
         <div class="card model-card" id="model-card-siglip2">
           <h3>SigLIP2 So400M</h3>
-          <p class="model-card__status" id="model-card-siglip2-status" data-i18n="unavailable">Unavailable</p>
-          <p class="model-card__dim" id="model-card-siglip2-dim">1152-D</p>
-          <p class="model-card__tag" data-i18n="experimentalUncalibrated">Experimental / Uncalibrated</p>
+          <dl class="kv model-card__kv">
+            <div class="kv__row">
+              <dt data-i18n="modelIdLabel">Model</dt>
+              <dd class="mono" dir="ltr">google/siglip2-so400m-patch14-384</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="embeddingLabel">Embedding</dt>
+              <dd id="model-card-siglip2-dim">1152-D</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="roleLabel">Role</dt>
+              <dd data-i18n="siglip2Role">Advanced Multimodal Evaluation Engine</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="statusLabelShort">Status</dt>
+              <dd class="model-card__status" id="model-card-siglip2-status" data-i18n="unavailable">Unavailable</dd>
+            </div>
+            <div class="kv__row">
+              <dt data-i18n="calibrationLabel">Calibration</dt>
+              <dd data-i18n="experimentalUncalibrated">Experimental / Uncalibrated</dd>
+            </div>
+          </dl>
         </div>
       </section>
 
@@ -221,14 +266,14 @@
           <li><span dir="ltr">CLIP / SigLIP2</span></li>
           <li><span id="pipeline-vector" data-i18n="pStepVector">Model-specific embeddings</span></li>
           <li><span data-i18n="pStepRetrieval">Tenant/site isolated retrieval</span></li>
-          <li><span data-i18n="pStepSignals">OCR + barcode signals</span></li>
+          <li><span data-i18n="pStepSignals">OCR + Barcode + contextual signals</span></li>
           <li><span data-i18n="pStepRanked">Ranked candidates</span></li>
           <li><span data-i18n="pStepFusion">Urban Intelligence fusion</span></li>
           <li><span data-i18n="pStepReview">Human verification</span></li>
         </ol>
         <p class="card__footnote" data-i18n="pipelineIsolationNote">
-          CLIP's 512-D and SigLIP2's 1152-D embeddings are never stored or searched in the same
-          index -- each engine keeps its own model-specific representation and retrieval index.
+          CLIP 512-D and SigLIP2 1152-D embeddings are maintained and searched in separate
+          model-specific vector spaces.
         </p>
       </section>
 

@@ -1,5 +1,5 @@
-/* CLIP AI Engine festival console -- static stylesheet, no external fonts
-   or frameworks, so the CSP for this page can stay 'self'-only. */
+/* Multimodal AL Engine festival console -- static stylesheet, no external
+   fonts or frameworks, so the CSP for this page can stay 'self'-only. */
 
 :root {
   --navy-950: #0a0f1e;
@@ -50,21 +50,14 @@ html[dir="rtl"] body {
 }
 
 .topbar__org {
-  font-size: 0.7rem;
-  letter-spacing: 0.12em;
-  color: var(--teal-300);
+  font-size: 1.25rem;
   font-weight: 700;
 }
 
 .topbar__tagline {
   font-size: 0.78rem;
-  color: var(--ink-300);
-}
-
-.topbar__product {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--ink-500);
+  letter-spacing: 0.04em;
+  color: var(--teal-300);
 }
 
 .lang-toggle {
@@ -153,7 +146,32 @@ html[dir="rtl"] body {
   color: var(--teal-300);
   font-weight: 700;
   font-size: 0.95rem;
-  margin: 0 0 1rem;
+  margin: 0 0 0.5rem;
+}
+
+.hero__model-meta {
+  display: flex;
+  justify-content: center;
+  gap: 2.5rem;
+  margin: 0 0 1.25rem;
+}
+
+.hero__model-meta-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+  font-size: 0.78rem;
+  color: var(--ink-300);
+}
+
+.hero__model-meta-col strong {
+  color: var(--ink-100);
+  font-size: 0.95rem;
+}
+
+.model-card__kv {
+  margin: 0;
 }
 
 .grid {
@@ -679,36 +697,18 @@ html[dir="rtl"] .demo-textarea {
   margin: 0.5rem 0 0;
 }
 
-.model-card {
-  text-align: center;
-}
-
 .model-card h3 {
-  margin: 0 0 0.5rem;
+  margin: 0 0 0.75rem;
   font-size: 1rem;
 }
 
 .model-card__status {
   font-weight: 700;
-  font-size: 1.05rem;
-  margin: 0 0 0.25rem;
   color: var(--ink-500);
 }
 
 .model-card__status.is-ready {
   color: var(--green-500);
-}
-
-.model-card__dim {
-  color: var(--teal-300);
-  font-weight: 700;
-  margin: 0 0 0.25rem;
-}
-
-.model-card__tag {
-  color: var(--ink-500);
-  font-size: 0.8rem;
-  margin: 0;
 }
 
 @media (max-width: 640px) {

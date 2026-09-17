@@ -2,7 +2,9 @@
 
 Status: implemented on branch `claude/lucid-feynman-i3g5u9`, **demo facade disabled by
 default** (`DEMO_FACADE_ENABLED=false`). Nothing here changes the default behaviour of the
-production CLIP service, `/v2/*`, or any existing protected endpoint.
+production CLIP service, `/v2/*`, or any existing protected endpoint. See section 14 for the
+P14.1 rebrand ("Multimodal AL Engine") and the intended new public hostname
+(`ai-engine.al-amentech.io`).
 
 ## 1. Architecture
 
@@ -353,3 +355,59 @@ spinner with static text ("Analyzing multimodal evidence…" / "جارٍ تحل�
 Every result view -- single-engine and compare -- permanently displays "AI-assisted candidate
 retrieval — human verification required." A match is retrieval evidence for a human reviewer,
 never an automatic confirmation of ownership or identity.
+
+## 14. P14.1 — rebrand ("Multimodal AL Engine") and new public hostname
+
+P14.1 is a branding/content/UI refinement only: no matching logic, embedding dimension, model
+configuration, authentication, demo facade security control, MongoDB configuration, API
+contract, tenant/site isolation, rate limit, production default engine (`clip_v1` stays
+`DEFAULT_EMBEDDING_ENGINE`), or deployment/nginx/DNS configuration changed. Only
+`templates/clip-console.html`, `static/clip-console.css`, `static/clip-console.js`, and the two
+pre-existing branding-string test assertions in `tests/test_festival_console.py` (which
+literally asserted the old brand strings this rebrand removes) changed.
+
+### New product name
+
+The console's visible product/site name is now **Multimodal AL Engine** (Arabic: `محرك الذكاء
+متعدد الوسائط`), replacing the old "CLIP AI Engine" name. The company wordmark "AL-AMEN
+TECHNOLOGY" / "Al-Amen Technology" no longer appears anywhere in the rendered page or its
+static assets -- the header now reads "Multimodal AL Engine" / "Urban Intelligence AI Lab"
+instead of "AL-AMEN TECHNOLOGY" / "Urban Intelligence AI Lab" / "CLIP AI Engine". The browser
+tab title is now `Multimodal AL Engine — Urban Intelligence` (was `CLIP AI Engine — Al-Amen
+Technology`). `tests/test_rebrand_p14_1.py` enforces all of this.
+
+Internal, non-visible identifiers are explicitly unchanged, per the P14.1 brief: `clip_v1`,
+`siglip2_v1`, `/demo/match`, `/v2/match`, `/v2/ab/match`, every Python class/module name, every
+environment variable, and every field in every API response.
+
+### New public hostname (documentation only -- no infrastructure change)
+
+**Intended new public hostname:** `ai-engine.al-amentech.io`
+**Previous hostname:** `clip.al-amentech.io`
+
+Planned eventual traffic path (not yet implemented):
+
+```
+ai-engine.al-amentech.io
+        |
+      nginx
+        |
+  festival canary
+```
+
+Recommended later infrastructure action (**not implemented by this commit**): configure nginx
+to answer `https://clip.al-amentech.io` with an `HTTP 301` redirect to
+`https://ai-engine.al-amentech.io`, once DNS for the new hostname is live and validated. This
+change is explicitly out of scope here -- no nginx configuration, DNS record, or redirect was
+added, modified, or deployed as part of P14.1. The application itself has no hostname-specific
+logic (CORS/allowed origins in `app.py` are unrelated to the Festival console's own static
+hostname and were not touched), so it continues to work correctly under either hostname without
+any code change once DNS/nginx are updated separately.
+
+### Rollback
+
+Identical to the P14 rollback (section 8): this is a pure static-asset/template content change
+with no new environment variable and no behavior gated by a flag. To revert the rebrand
+specifically, redeploy the previous commit's `templates/clip-console.html`,
+`static/clip-console.css`, and `static/clip-console.js` -- no database, config, or
+infrastructure change is involved either way.

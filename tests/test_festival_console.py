@@ -1,5 +1,6 @@
 """
-Festival CLIP AI Engine console (docs/FESTIVAL_CLIP_CONSOLE.md): GET "/"
+Festival console (docs/FESTIVAL_CLIP_CONSOLE.md; rebranded "Multimodal AL
+Engine" in P14.1, see docs/P14_FESTIVAL_LIVE_GUI.md): GET "/"
 used to return a bare {"status": "ok"} JSON body -- there was no browser
 demonstration surface for the Dubai AI Festival, even though every other
 control (signed identity, tenant/site scoping, demo governance, model
@@ -53,10 +54,14 @@ class FestivalConsoleTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers.get("content-type", ""))
 
-    # 3: contains "CLIP AI Engine".
+    # 3 (P14.1 rebrand): contains "Multimodal AL Engine", the product's
+    # current visible name -- "CLIP AI Engine" was the pre-P14.1 name and
+    # is deliberately no longer shown in the GUI (see
+    # docs/P14_FESTIVAL_LIVE_GUI.md and tests/test_rebrand_p14_1.py for the
+    # full rebrand test coverage).
     def test_root_contains_title(self):
         response = self.client.get("/")
-        self.assertIn("CLIP AI Engine", response.text)
+        self.assertIn("Multimodal AL Engine", response.text)
 
     # 4: contains "Dubai AI Festival 2026".
     def test_root_contains_festival_banner(self):
@@ -75,7 +80,7 @@ class FestivalConsoleTests(unittest.TestCase):
         self.assertIn('data-lang="ar"', response.text)
         js = (REPO_ROOT / "static" / "clip-console.js").read_text(encoding="utf-8")
         self.assertIn('setAttribute("dir", "rtl")', js)
-        self.assertIn("محرك CLIP للذكاء الاصطناعي", js)
+        self.assertIn("محرك الذكاء متعدد الوسائط", js)  # P14.1: Arabic for "Multimodal AL Engine"
 
     # 7: /docs still works.
     def test_docs_still_works(self):
