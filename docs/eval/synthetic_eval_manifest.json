@@ -1,0 +1,139 @@
+{
+  "datasetVersion": "synthetic-eval-v1",
+  "isSynthetic": true,
+  "demoData": true,
+  "tenantId": "eval-synthetic-tenant",
+  "siteId": "eval-synthetic-site",
+  "description": "Hand-authored synthetic fixture for exercising the evaluation harness's own metric computation (recall@K, MRR) and, when real model access is available, for a first functional smoke pass of clip_v1/siglip2_v1 retrieval. Every title/description/OCR/label below is fabricated for this fixture -- none of it is real lost-and-found data, and results produced from it are NOT evidence of real-world matching accuracy. See docs/eval/README.md.",
+  "corpus": [
+    {
+      "candidateId": "cand-wallet-red",
+      "syntheticEmbeddingSeed": 101,
+      "title": "Red leather wallet with gold clasp",
+      "labels": ["wallet", "leather", "red"],
+      "ocrText": "AL-AMEN FESTIVAL 2026",
+      "barcodeValues": []
+    },
+    {
+      "candidateId": "cand-wallet-black",
+      "syntheticEmbeddingSeed": 102,
+      "title": "Black nylon wallet, worn corners",
+      "labels": ["wallet", "nylon", "black"],
+      "ocrText": "",
+      "barcodeValues": []
+    },
+    {
+      "candidateId": "cand-backpack-blue",
+      "syntheticEmbeddingSeed": 103,
+      "title": "Navy blue backpack with laptop sleeve",
+      "labels": ["backpack", "blue", "laptop-bag"],
+      "ocrText": "",
+      "barcodeValues": ["8801234567890"]
+    },
+    {
+      "candidateId": "cand-backpack-green",
+      "syntheticEmbeddingSeed": 104,
+      "title": "Forest green hiking backpack",
+      "labels": ["backpack", "green", "hiking"],
+      "ocrText": "",
+      "barcodeValues": []
+    },
+    {
+      "candidateId": "cand-phone-white",
+      "syntheticEmbeddingSeed": 105,
+      "title": "White smartphone with cracked screen",
+      "labels": ["phone", "electronics", "white"],
+      "ocrText": "IMEI 000000000000000",
+      "barcodeValues": []
+    },
+    {
+      "candidateId": "cand-umbrella-yellow",
+      "syntheticEmbeddingSeed": 106,
+      "title": "Bright yellow compact umbrella",
+      "labels": ["umbrella", "yellow"],
+      "ocrText": "",
+      "barcodeValues": []
+    },
+    {
+      "candidateId": "cand-keys-set",
+      "syntheticEmbeddingSeed": 107,
+      "title": "Keyring with four keys and a car fob",
+      "labels": ["keys", "keyring"],
+      "ocrText": "",
+      "barcodeValues": []
+    },
+    {
+      "candidateId": "cand-sunglasses-brown",
+      "syntheticEmbeddingSeed": 108,
+      "title": "Brown tortoiseshell sunglasses in a hard case",
+      "labels": ["sunglasses", "brown"],
+      "ocrText": "",
+      "barcodeValues": []
+    }
+  ],
+  "queries": [
+    {
+      "queryId": "q-wallet-red-en",
+      "modality": "text",
+      "language": "en",
+      "text": "red leather wallet with a gold clasp",
+      "expectedCandidateId": "cand-wallet-red"
+    },
+    {
+      "queryId": "q-wallet-red-ar",
+      "modality": "text",
+      "language": "ar",
+      "text": "محفظة جلدية حمراء بإبزيم ذهبي",
+      "expectedCandidateId": "cand-wallet-red"
+    },
+    {
+      "queryId": "q-wallet-black-en",
+      "modality": "text",
+      "language": "en",
+      "text": "worn black nylon wallet",
+      "expectedCandidateId": "cand-wallet-black"
+    },
+    {
+      "queryId": "q-backpack-blue-en",
+      "modality": "text",
+      "language": "en",
+      "text": "navy backpack with a laptop compartment",
+      "expectedCandidateId": "cand-backpack-blue"
+    },
+    {
+      "queryId": "q-backpack-green-ar",
+      "modality": "text",
+      "language": "ar",
+      "text": "حقيبة ظهر خضراء للتنزه",
+      "expectedCandidateId": "cand-backpack-green"
+    },
+    {
+      "queryId": "q-phone-white-en",
+      "modality": "text",
+      "language": "en",
+      "text": "white phone, screen is cracked",
+      "expectedCandidateId": "cand-phone-white"
+    },
+    {
+      "queryId": "q-umbrella-yellow-mixed",
+      "modality": "text",
+      "language": "mixed",
+      "text": "small yellow umbrella مظلة صفراء",
+      "expectedCandidateId": "cand-umbrella-yellow"
+    },
+    {
+      "queryId": "q-keys-set-en",
+      "modality": "text",
+      "language": "en",
+      "text": "set of keys with a car remote attached",
+      "expectedCandidateId": "cand-keys-set"
+    },
+    {
+      "queryId": "q-sunglasses-brown-en",
+      "modality": "text",
+      "language": "en",
+      "text": "tortoiseshell sunglasses with a hard case",
+      "expectedCandidateId": "cand-sunglasses-brown"
+    }
+  ]
+}
