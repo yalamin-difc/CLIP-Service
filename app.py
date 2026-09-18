@@ -2275,6 +2275,29 @@ def health_ready(request: Request):
     return JSONResponse(status_code=200 if ready else 503, content=payload)
 
 
+def warmup_optional_engines() -> None:
+    """Best-effort startup warmup for registry engines beyond the required
+    CLIP path above. DEFAULT_EMBEDDING_ENGINE stays clip_v1 and CLIP's own
+    fail-closed warmup_model() call is completely unmodified -- this runs
+    strictly after it and can never affect it.
+
+    Today this only concerns siglip2_v1: Siglip2Engine.warmup() already
+    no-ops unless SIGLIP2_ENABLED and SIGLIP2_LOAD_ON_START are both true,
+    and already catches and logs any failure instead of raising. The
+    try/except here is defense in depth so that even a future engine whose
+    warmup() does not honor that contract still cannot take down process
+    startup or CLIP's readiness.
+    """
+    from embedding_engines.registry import get_engine
+
+    try:
+        get_engine("siglip2_v1").warmup()
+    except Exception:
+        logger.warning(
+            "Optional engine warmup raised unexpectedly; CLIP startup is unaffected", exc_info=True
+        )
+
+
 def initialize_runtime() -> None:
     validate_auth_configuration()
     configured_device()
@@ -2284,6 +2307,7 @@ def initialize_runtime() -> None:
     if OCR_ENABLED and not ocr_dependency_ready(OCR_LANGUAGES):
         raise RuntimeError("Configured OCR dependency or language data is unavailable")
     warmup_model()
+    warmup_optional_engines()
 
 
 @app.on_event("startup")

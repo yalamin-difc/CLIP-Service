@@ -332,14 +332,65 @@ class Siglip2Engine(EmbeddingEngine):
 
     def warmup(self) -> None:
         """Best-effort warmup; never raises. A SigLIP2 warmup failure must
-        never affect process startup or the CLIP engine's own readiness."""
+        never affect process startup or the CLIP engine's own readiness.
+
+        Called from app.py's initialize_runtime() (startup) so that, on a
+        festival canary with SIGLIP2_ENABLED=true and SIGLIP2_LOAD_ON_START
+        =true, the model is downloaded/loaded and exercised once before the
+        process starts accepting traffic -- the first real /v2/embeddings*
+        or /v2/match call then hits an already-loaded model instead of
+        paying the cold-load cost (which can exceed a client's request
+        timeout and surface as a 504). With either flag false (the
+        default), this is a no-op and siglip2_v1 keeps lazy-loading on
+        first use exactly as before.
+
+        Logs one structured "engine_warmup" outcome line (skipped/success/
+        failed) with duration where applicable -- engine id, model id and
+        error *type* only, never a stack trace's contents, a request
+        payload, or any credential/token.
+        """
         if not self.is_enabled() or not cfg.SIGLIP2_LOAD_ON_START:
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "engine_warmup",
+                        "engine": self.engine_id,
+                        "modelId": self.model_id,
+                        "outcome": "skipped",
+                        "reason": "engine_disabled" if not self.is_enabled() else "load_on_start_disabled",
+                    }
+                )
+            )
             return
+        started = time.time()
         try:
             self.encode_image(Image.new("RGB", (32, 32), "white"))
             self._warmup_completed = True
-        except Exception:
-            logger.warning("SigLIP2 warmup failed; engine remains lazily loadable on demand", exc_info=True)
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "engine_warmup",
+                        "engine": self.engine_id,
+                        "modelId": self.model_id,
+                        "outcome": "success",
+                        "durationSeconds": round(time.time() - started, 3),
+                    }
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                json.dumps(
+                    {
+                        "event": "engine_warmup",
+                        "engine": self.engine_id,
+                        "modelId": self.model_id,
+                        "outcome": "failed",
+                        "durationSeconds": round(time.time() - started, 3),
+                        "errorType": type(exc).__name__,
+                    }
+                ),
+                exc_info=True,
+            )
 
     # -- observability -----------------------------------------------
     def readiness(self) -> EngineReadiness:

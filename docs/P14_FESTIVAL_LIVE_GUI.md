@@ -278,6 +278,76 @@ demo items' image files, named to match each item's `candidateFilename` metadata
 `queries/` (unused by this endpoint; reserved for future sample-query features). nginx
 configuration is unchanged by this work.
 
+### Enabling SigLIP2 startup warmup (`SIGLIP2_LOAD_ON_START=true`)
+
+The canary command above deliberately keeps `SIGLIP2_LOAD_ON_START=false`, its default: SigLIP2
+then lazy-loads on the *first* real request to it, which pays the model's one-time load cost as
+a cold-start hit on whichever visitor happens to send that first request. `Siglip2Engine.warmup()`
+exists specifically to move that cost to process startup instead, but nothing called it until
+this change wired it into `initialize_runtime()` (`app.py`'s `@app.on_event("startup")` handler,
+via the new `warmup_optional_engines()`) -- so turning the flag on is now enough:
+
+```bash
+docker run -d --name clip-service-canary -p 8080:8080 \
+  -e STORAGE_MODE=mongodb -e MONGODB_URI=$MONGODB_URI -e INTERNAL_JWT_SECRET=$INTERNAL_JWT_SECRET \
+  -e INFERENCE_DEVICE=cpu \
+  -e SIGLIP2_ENABLED=true -e SIGLIP2_MODEL_REVISION=e8e487298228002f3d8a82e0cd5c8ea9c567f57f \
+  -e SIGLIP2_DEVICE=cpu -e SIGLIP2_LOAD_ON_START=true \
+  -e AB_TEST_ENABLED=true \
+  -e DEMO_FACADE_ENABLED=true \
+  -e DEMO_TENANT_ID=festival-demo \
+  -e DEMO_SITE_ID=dubai-ai-festival \
+  -e DEMO_DATASET_VERSION=daf-2026-v1 \
+  -e DEMO_ASSET_DIR=/opt/demo-data \
+  -e DEMO_RATE_LIMIT_PER_MINUTE=12 \
+  -e DEMO_TOP_K=3 \
+  -v /opt/demo-data:/opt/demo-data:ro \
+  clip-service:p14-demo
+```
+
+**What changes, and what does not:**
+
+- `DEFAULT_EMBEDDING_ENGINE` stays `clip_v1` and CLIP's own required warmup (`warmup_model()`)
+  runs first, exactly as before -- this flag only adds a second, independent, best-effort
+  warmup step for `siglip2_v1` immediately after it. If that step fails for any reason (model
+  download error, dependency problem, a bad `SIGLIP2_MODEL_REVISION`), it is caught and logged;
+  it can never fail container startup and can never affect CLIP's readiness. `siglip2_v1` then
+  simply falls back to lazy-loading on first use, i.e. exactly today's `SIGLIP2_LOAD_ON_START
+  =false` behavior for that one engine, while CLIP keeps working normally throughout.
+- Startup now blocks until *both* warmups finish (CLIP's, then SigLIP2's) before the process
+  starts accepting connections -- this is intentional: the goal is for SigLIP2 to already be
+  ready before any visitor traffic arrives, not merely to start faster and warm up in the
+  background while early requests risk a cold-load 504.
+
+**Startup grace time -- do not assume a fixed number.** SigLIP2 So400M is a large model
+(~3.5GB of weights); loading it (first-ever pull from Hugging Face, or from a warm local cache
+on a redeployed host) plus one real inference pass is a one-time cost noticeably larger than
+the steady-state ~2-3 second per-query CPU inference time quoted in section 12 below, and it
+was not measured from this sandbox (no network access to actually download the model here --
+see `docs/AZURE_CANARY_VERIFICATION.md`). Do not hardcode a grace period from this document.
+Instead, on the very first canary start with this flag on:
+
+1. Increase the platform's container/process startup timeout (Azure's health-check initial
+   delay, or the orchestrator's equivalent) generously beyond CLIP's already-known warmup time,
+   since it must now also cover SigLIP2's one-time load.
+2. Read the actual duration from the structured log line `Siglip2Engine.warmup()` emits on
+   completion -- `{"event": "engine_warmup", "engine": "siglip2_v1", "outcome": "success",
+   "durationSeconds": ...}` (or `"outcome": "failed"` with an `errorType`, never a stack trace
+   or secret, if it didn't complete) -- and use that *observed* number, with margin, to size the
+   grace period for subsequent restarts of that same host/image.
+3. **Verify before routing demo traffic**, per `docs/AZURE_CANARY_VERIFICATION.md` Check 4: a
+   real `POST /v2/embeddings/image` and `POST /v2/embeddings/text` against the just-started
+   canary (a real file/text, a valid internal JWT, `engine=siglip2_v1`) must both return HTTP
+   200 with a populated `embeddingDimension`/`preprocessingVersion` -- not a `503
+   engine_unavailable`/`engine_disabled` -- before pointing festival traffic (or `AB_TEST_ENABLED`
+   comparisons) at this instance. `GET /v2/models` (or `/health`'s `engines.siglip2_v1` block)
+   showing `"ready": true` is the same signal, cheaper to poll in a loop while waiting.
+4. Never widen `SIGLIP2_INFERENCE_TIMEOUT_MS`, `INFERENCE_TIMEOUT_MS`, or any other per-request
+   timeout to paper over a slow or failed startup warmup -- those govern individual request
+   latency, not process startup, and loosening them would only let a genuinely broken engine
+   hang requests longer instead of failing fast. If warmup keeps failing, fix the underlying
+   cause (model revision, network egress, disk space for the weights) instead.
+
 ### Rollback
 
 ```bash
