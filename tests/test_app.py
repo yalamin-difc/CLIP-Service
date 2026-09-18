@@ -450,5 +450,56 @@ class ClipServiceSecurityTests(unittest.TestCase):
                 clip_service.build_repository()
 
 
+class WarmupOptionalEnginesTests(unittest.TestCase):
+    """warmup_optional_engines() connects the registry's siglip2_v1 warmup()
+    to startup (see initialize_runtime()), and must never let a SigLIP2
+    warmup problem propagate into process startup or affect CLIP -- CLIP's
+    own warmup_model() call always runs first and is untouched by any of
+    this."""
+
+    def test_calls_siglip2_engine_warmup(self):
+        from unittest.mock import MagicMock
+
+        fake_engine = MagicMock()
+        with patch("embedding_engines.registry.get_engine", return_value=fake_engine) as get_engine_mock:
+            clip_service.warmup_optional_engines()
+        get_engine_mock.assert_called_once_with("siglip2_v1")
+        fake_engine.warmup.assert_called_once_with()
+
+    def test_isolates_a_warmup_call_that_unexpectedly_raises(self):
+        from unittest.mock import MagicMock
+
+        fake_engine = MagicMock()
+        fake_engine.warmup.side_effect = RuntimeError("boom")
+        with patch("embedding_engines.registry.get_engine", return_value=fake_engine):
+            clip_service.warmup_optional_engines()  # must not raise
+
+    def test_isolates_get_engine_itself_raising(self):
+        with patch("embedding_engines.registry.get_engine", side_effect=RuntimeError("registry exploded")):
+            clip_service.warmup_optional_engines()  # must not raise
+
+    def test_initialize_runtime_warms_clip_before_optional_engines_and_does_not_fail_the_process(self):
+        # A defense-in-depth failure inside warmup_optional_engines() must
+        # never be visible to initialize_runtime() at all (it never
+        # raises), and initialize_runtime() itself must remain exactly as
+        # fail-closed as before for the required CLIP path (validate_auth_
+        # configuration/configured_device/store health/OCR checks are
+        # untouched -- only mocked here so this test doesn't need a real
+        # DB/OCR dependency).
+        call_order = []
+        with patch.object(clip_service, "validate_auth_configuration"), patch.object(
+            clip_service, "configured_device"
+        ), patch.object(clip_service, "get_repository") as get_repository_mock, patch.object(
+            clip_service, "OCR_ENABLED", False
+        ), patch.object(
+            clip_service, "warmup_model", side_effect=lambda: call_order.append("clip")
+        ), patch.object(
+            clip_service, "warmup_optional_engines", side_effect=lambda: call_order.append("optional")
+        ):
+            get_repository_mock.return_value.health.return_value = {"ok": True}
+            clip_service.initialize_runtime()
+        self.assertEqual(call_order, ["clip", "optional"])
+
+
 if __name__ == "__main__":
     unittest.main()

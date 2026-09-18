@@ -331,6 +331,89 @@ class Siglip2EngineTests(unittest.TestCase):
         self.assertFalse(readiness.loaded)
         self.assertFalse(readiness.ready)
 
+    # -- warmup(): connects startup (app.py's initialize_runtime(), via
+    # warmup_optional_engines()) to this engine so a festival canary with
+    # SIGLIP2_ENABLED=SIGLIP2_LOAD_ON_START=true is actually ready before
+    # the first real visitor request, instead of paying a cold-load cost
+    # on that first request (previously: warmup() existed but nothing
+    # ever called it).
+    def test_warmup_skipped_when_disabled(self):
+        # SIGLIP2_ENABLED is False by default (self.engine is unpatched).
+        with patch.object(engine_config, "SIGLIP2_LOAD_ON_START", True):
+            self.engine.warmup()
+        self.assertFalse(self.engine._warmup_completed)
+        self.assertFalse(self.engine.readiness().ready)
+
+    def test_warmup_skipped_when_load_on_start_false(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.object(
+            engine_config, "SIGLIP2_LOAD_ON_START", False
+        ):
+            self.engine.warmup()
+            self.assertFalse(self.engine._warmup_completed)
+            self.assertFalse(self.engine.readiness().ready)
+
+    def test_warmup_success_marks_completed_and_ready_and_logs_duration(self):
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.object(
+            engine_config, "SIGLIP2_LOAD_ON_START", True
+        ), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._load_with_fakes(image_vector=self._real_1152_vector(), image_dim=1152)
+            with self.assertLogs("embedding_engines.siglip2_engine", level="INFO") as logs:
+                self.engine.warmup()
+            self.assertTrue(any("\"outcome\": \"success\"" in line for line in logs.output))
+            self.assertTrue(any("\"durationSeconds\"" in line for line in logs.output))
+            readiness = self.engine.readiness()
+            self.assertTrue(readiness.warmup_completed)
+            self.assertTrue(readiness.ready)
+
+    def test_warmup_failure_never_raises_and_reports_not_ready(self):
+        class ExplodingModel:
+            def get_image_features(self, **inputs):
+                raise RuntimeError("simulated cold-start failure")
+
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.object(
+            engine_config, "SIGLIP2_LOAD_ON_START", True
+        ), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._load_with_fakes(image_dim=1152)
+            self.engine._model = ExplodingModel()
+            with self.assertLogs("embedding_engines.siglip2_engine", level="WARNING") as logs:
+                self.engine.warmup()  # must not raise
+            self.assertTrue(any("\"outcome\": \"failed\"" in line for line in logs.output))
+            self.assertTrue(any("\"errorType\": \"EngineUnavailableError\"" in line for line in logs.output))
+            readiness = self.engine.readiness()
+            self.assertFalse(readiness.warmup_completed)
+            self.assertFalse(readiness.ready)
+
+    def test_warmup_failure_does_not_disable_on_demand_inference_afterwards(self):
+        # A failed startup warmup must leave the engine exactly as usable
+        # on demand as if SIGLIP2_LOAD_ON_START had been false all along --
+        # this is what "CLIP remains usable [and SigLIP2 stays optional]"
+        # means for SigLIP2 itself, not just for CLIP.
+        class ExplodingThenWorkingModel:
+            def __init__(self):
+                self.calls = 0
+
+            def get_image_features(self, **inputs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("simulated cold-start failure")
+                return np.asarray([self._vector])
+
+        with patch.object(engine_config, "SIGLIP2_ENABLED", True), patch.object(
+            engine_config, "SIGLIP2_LOAD_ON_START", True
+        ), patch.dict(sys.modules, {"torch": _FakeTorchModule("torch")}):
+            self._load_with_fakes(image_dim=1152)
+            model = ExplodingThenWorkingModel()
+            model._vector = self._real_1152_vector()
+            self.engine._model = model
+            self.engine.warmup()
+            self.assertFalse(self.engine.readiness().ready)
+
+            from PIL import Image
+
+            vector = self.engine.encode_image(Image.new("RGB", (8, 8)))
+            self.assertEqual(len(vector), 1152)
+            self.assertTrue(self.engine.readiness().ready)
+
 
 class NumpyVectorIndexTests(unittest.TestCase):
     def setUp(self):
