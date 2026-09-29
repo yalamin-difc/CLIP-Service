@@ -1,0 +1,21 @@
+{
+  "datasetVersion": "synthetic-calibration-self-check-v1",
+  "isSynthetic": true,
+  "description": "Hand-authored, entirely fabricated (topScore, secondScore, label) triples. This proves scripts/calibrate.py's sweep/confusion-matrix/F1 arithmetic is correct -- it is NOT a real SigLIP2 accuracy measurement and must never be cited as one. Real calibration requires D-5's real, reviewed, labelled eval set (see docs/eval/README.md).",
+  "cases": [
+    {"caseId": "true-1", "topScore": 0.85, "secondScore": 0.55, "label": true},
+    {"caseId": "true-2", "topScore": 0.78, "secondScore": 0.50, "label": true},
+    {"caseId": "true-3", "topScore": 0.70, "secondScore": 0.45, "label": true},
+    {"caseId": "true-4", "topScore": 0.65, "secondScore": 0.40, "label": true},
+    {"caseId": "true-5", "topScore": 0.90, "secondScore": 0.60, "label": true},
+    {"caseId": "true-6", "topScore": 0.60, "secondScore": 0.35, "label": true},
+    {"caseId": "false-1", "topScore": 0.30, "secondScore": 0.28, "label": false},
+    {"caseId": "false-2", "topScore": 0.40, "secondScore": 0.38, "label": false},
+    {"caseId": "false-3", "topScore": 0.55, "secondScore": 0.53, "label": false},
+    {"caseId": "false-4", "topScore": 0.20, "secondScore": 0.10, "label": false},
+    {"caseId": "false-5", "topScore": 0.62, "secondScore": 0.60, "label": false},
+    {"caseId": "false-6", "topScore": 0.45, "secondScore": null, "label": false},
+    {"caseId": "false-7", "topScore": 0.35, "secondScore": 0.33, "label": false},
+    {"caseId": "false-8", "topScore": 0.58, "secondScore": 0.56, "label": false}
+  ]
+}
