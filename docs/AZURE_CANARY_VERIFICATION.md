@@ -187,7 +187,7 @@ structured log line per successful combined load, e.g.:
 ```json
 {"event": "model_load", "engine": "siglip2_v1", "modelId": "google/siglip2-so400m-patch14-384",
  "modelRevision": "<configured-revision>", "preprocessingVersion": "<fingerprint>",
- "device": "cpu", "loadSeconds": 2.41}
+ "weightChecksum": "<weight-fingerprint>", "device": "cpu", "loadSeconds": 2.41}
 ```
 
 Retrieve it with `docker logs clip-service-canary | grep '"event": "model_load"'` (or the
@@ -195,6 +195,22 @@ platform's centralized log store, if wired). This one log line is emitted by the
 `load()` call that loads both, so its existence corroborates a single successful combined
 load — it is not, on its own, proof that the *revision* named in it is what actually got
 cached (that's Check 2's job).
+
+**D-3 addition — `weightChecksum`:** a fingerprint of the *actually loaded weight tensors*
+(`Siglip2Engine._compute_weight_checksum`), not the configured revision string. Two canary runs
+that report the same `modelRevision` but a *different* `weightChecksum` mean the cache was
+re-populated with different weights between those runs despite an unchanged configured revision
+— treat that as a real divergence to escalate, same as a snapshot-directory mismatch above. A
+`null` `weightChecksum` on an otherwise-successful load means the loaded model object exposed no
+`state_dict()` — investigate rather than ignore.
+
+**D-3 addition — startup is now fail-fast on an unpinned revision:** `SIGLIP2_ENABLED=true` with
+`SIGLIP2_MODEL_REVISION` empty or `"main"`/`"latest"` no longer reaches this canary procedure at
+all — `app.py`'s `initialize_runtime()` now rejects process startup outright
+(`embedding_engines/config.py`'s `validate_siglip2_configuration()`). If the canary container is
+running with `SIGLIP2_ENABLED=true`, that alone is now evidence `SIGLIP2_MODEL_REVISION` is
+already pinned to something other than `"main"`/`"latest"`/empty — Check 2 still establishes
+*which* commit, this just rules out the unpinned-placeholder case by construction.
 
 ## Check 4 — Successful real image and text inference
 
