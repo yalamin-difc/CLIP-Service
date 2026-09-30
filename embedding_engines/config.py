@@ -43,7 +43,44 @@ SIGLIP2_MODEL_ID = os.environ.get("SIGLIP2_MODEL_ID", "google/siglip2-so400m-pat
 # docs/P13_SIGLIP2_AB_IMPLEMENTATION.md, section "Pinning the SigLIP2
 # revision" -- and set SIGLIP2_MODEL_REVISION to that commit hash so the
 # model can never silently drift underneath a running deployment.
+#
+# D-3: this used to be documentation-only -- nothing stopped a deployment
+# from setting SIGLIP2_ENABLED=true while leaving SIGLIP2_MODEL_REVISION at
+# its "main" default. validate_siglip2_configuration() (called from
+# app.py's initialize_runtime(), unconditionally and before any engine
+# warmup) now turns that into a hard startup failure.
 SIGLIP2_MODEL_REVISION = os.environ.get("SIGLIP2_MODEL_REVISION", "main").strip() or "main"
+
+# D-3: revision values that can silently point at different actual weights
+# over time -- a mutable branch ref, or "no value configured at all" (which
+# the assignment above already folds into "main"). Compared case-
+# insensitively so "Main"/"LATEST" etc. are caught too.
+_UNPINNED_SIGLIP2_REVISIONS = frozenset({"", "main", "latest"})
+
+
+def validate_siglip2_configuration() -> None:
+    """D-3: reject startup if SigLIP2 is enabled but its revision is not a
+    real pinned commit. Checked unconditionally whenever SIGLIP2_ENABLED is
+    true -- regardless of SIGLIP2_LOAD_ON_START -- so a misconfigured
+    deployment fails fast at process startup rather than silently serving
+    an unpinned, driftable model the first time SigLIP2 is actually
+    invoked (which, with the default SIGLIP2_LOAD_ON_START=false, could be
+    long after startup, on a live request).
+
+    This is a configuration-validation failure, not a transient load/
+    network error: it raises (like internal_auth.validate_auth_configuration()
+    and app.py's configured_device()) rather than logging and continuing,
+    which is the deliberate, documented behavior of Siglip2Engine.load()/
+    warmup() for genuine runtime failures.
+    """
+    if not SIGLIP2_ENABLED:
+        return
+    if SIGLIP2_MODEL_REVISION.strip().lower() in _UNPINNED_SIGLIP2_REVISIONS:
+        raise RuntimeError(
+            "SIGLIP2_MODEL_REVISION must be pinned to a real commit SHA when SIGLIP2_ENABLED=true "
+            f"(got {SIGLIP2_MODEL_REVISION!r}). See docs/P13_SIGLIP2_AB_IMPLEMENTATION.md, "
+            "section 'Pinning the SigLIP2 revision', for how to resolve and set one."
+        )
 
 SIGLIP2_DEVICE = os.environ.get("SIGLIP2_DEVICE", "cpu").strip().lower() or "cpu"
 SIGLIP2_LOAD_ON_START = _bool_env("SIGLIP2_LOAD_ON_START", False)

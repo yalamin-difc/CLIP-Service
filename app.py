@@ -2301,6 +2301,13 @@ def warmup_optional_engines() -> None:
 def initialize_runtime() -> None:
     validate_auth_configuration()
     configured_device()
+    # D-3: a hard configuration-validation failure, same category as the
+    # two checks above -- must run before any engine warmup, and must
+    # raise (not log-and-continue) so a misconfigured deployment never
+    # starts accepting traffic with an unpinned, driftable SigLIP2
+    # revision. Unconditional: this is checked whenever SIGLIP2_ENABLED is
+    # true, regardless of SIGLIP2_LOAD_ON_START.
+    engine_config.validate_siglip2_configuration()
     store = get_repository()
     if not store.health().get("ok"):
         raise RuntimeError("Configured database is unavailable")
