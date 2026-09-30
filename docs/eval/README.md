@@ -106,6 +106,7 @@ To turn this into a genuine accuracy benchmark:
    feed the resulting `recallAt*`/`meanReciprocalRank` numbers into a real
    calibration pass for `SIGLIP2_MIN_SCORE`/`SIGLIP2_MIN_MARGIN`
    (`embedding_engines/config.py`) — never reusing CLIP's own thresholds.
+   `scripts/calibrate.py` (below) is that calibration pass.
 
 ## Retrieval-quality benchmark (D-5)
 
@@ -183,3 +184,82 @@ network access to the pinned `MODEL_REVISION` regenerates both files
 with genuine measured numbers in place of the skipped section — nothing
 else about the format changes. `scripts/benchmark.py` never overwrites
 `app.MODEL_REVISION`; the report only ever reads and echoes it.
+
+## Calibration (D-4)
+
+`scripts/calibrate.py` sweeps a grid of `(min_score, min_margin)` pairs
+against a **labelled** eval set — cases of `(topScore, secondScore, label)`
+where `label` is whether the top-ranked candidate really was the correct
+match — and writes the pair that maximises F1 (or, with
+`--target-precision`, the pair with the highest recall among those at or
+above that precision) to `calibration.json`. It reuses `app.py`'s own
+`should_return_no_match()` to classify every case, so a calibration run
+can never silently diverge from what the live `/v2/match` decision
+actually does.
+
+**This is a different eval-set shape than `synthetic_eval_manifest.json`
+above.** That manifest is retrieval-shaped (one query → one expected
+candidate, used for recall@K/MRR). Calibration needs an explicit
+true/false label *per decision* — including genuine negatives (a
+plausible-looking but wrong top candidate) — which a single-expected-
+candidate retrieval manifest doesn't carry. See
+`docs/eval/synthetic_calibration_set.json` for the format:
+
+```jsonc
+{
+  "datasetVersion": "...",
+  "isSynthetic": true,   // required, same hard refusal as evaluate_models.py
+  "cases": [
+    {"caseId": "...", "topScore": 0.85, "secondScore": 0.55, "label": true},
+    {"caseId": "...", "topScore": 0.30, "secondScore": 0.28, "label": false}
+  ]
+}
+```
+
+`secondScore` may be omitted/`null` for a query with only one candidate.
+
+### What the bundled example set does (and does not) prove
+
+`docs/eval/synthetic_calibration_set.json` is 14 hand-authored, entirely
+fabricated `(topScore, secondScore, label)` triples, deliberately
+constructed to be perfectly separable. Running `scripts/calibrate.py`
+against it (see `tests/test_calibrate.py`) proves the sweep, confusion-
+matrix, and F1/precision/recall arithmetic are correct — **it is not, and
+must never be cited as, a real SigLIP2 accuracy measurement**, for exactly
+the same reason `harnessSelfCheck` above isn't one.
+
+**D-4 depends on D-5's eval set.** A real calibration run needs real
+`topScore`/`secondScore` values from real SigLIP2 inference against real,
+reviewed, labelled recovery cases — which do not exist in this repository
+yet. `docs/eval/retrieval_quality_labelled_set.json` (above) is fixture
+data, not that reviewed real-case dataset, so it does not change this:
+until a real, reviewed labelled set exists, `docs/eval/calibration.json`
+does not exist in this repo, and `siglip2_v1`'s `calibrationStatus`
+correctly reports `"uncalibrated"` in every environment that hasn't run a
+real calibration itself.
+
+### Running it
+
+```bash
+# Self-check only (proves the arithmetic, not real accuracy):
+python scripts/calibrate.py --eval-set docs/eval/synthetic_calibration_set.json \
+  --output /tmp/calibration-selfcheck.json
+
+# A real calibration run, once a real reviewed labelled set exists:
+python scripts/calibrate.py --eval-set path/to/real_labelled_set.json \
+  --output docs/eval/calibration.json --target-precision 0.9
+```
+
+### How it's loaded at runtime
+
+`embedding_engines/config.py`'s `get_siglip2_calibration_status()` /
+`get_siglip2_min_score()` / `get_siglip2_min_margin()` read
+`SIGLIP2_CALIBRATION_FILE` (default `docs/eval/calibration.json`,
+overridable via env var) on every call — no caching, no restart required
+for a newly-written file to take effect. An explicit `SIGLIP2_MIN_SCORE`/
+`SIGLIP2_MIN_MARGIN` environment variable, when set, always overrides the
+file (an operator's explicit choice wins). `Siglip2Engine.calibration_status`
+and `/v2/match`'s per-decision `calibrationStatus` both call these same
+functions, so they can never disagree with each other or with what
+actually gated the decision. **CLIP's `CONF_MIN_SCORE`/`CONF_MIN_MARGIN`
+and its `"calibrated"` status are completely untouched by any of this.**

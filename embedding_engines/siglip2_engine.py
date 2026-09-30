@@ -90,7 +90,12 @@ class Siglip2Engine(EmbeddingEngine):
 
     @property
     def calibration_status(self) -> str:
-        return cfg.SIGLIP2_CALIBRATION_STATUS
+        # D-4: "uncalibrated" until scripts/calibrate.py has written a
+        # valid docs/eval/calibration.json, then "calibrated:<evalDate>"
+        # -- computed fresh each call (see
+        # config.get_siglip2_calibration_status()) so it always reflects
+        # the file's real, current presence/content, never a cached flag.
+        return cfg.get_siglip2_calibration_status()
 
     def _configured_device(self) -> str:
         device = cfg.SIGLIP2_DEVICE
