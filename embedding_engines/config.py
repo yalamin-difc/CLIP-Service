@@ -7,7 +7,10 @@ surfaces, all of which default to off.
 """
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -53,11 +56,93 @@ AB_UI_ENABLED = _bool_env("AB_UI_ENABLED", False)
 
 # SigLIP2 scoring is a separate, uncalibrated space -- CLIP's minScore/
 # minMargin thresholds (CONF_MIN_SCORE/CONF_MIN_MARGIN in app.py) must
-# never be reused here. These exist so a future calibration pass has a
-# named place to put real, evaluation-derived thresholds without touching
-# CLIP's configuration.
-SIGLIP2_CALIBRATION_STATUS = "uncalibrated"
+# never be reused here. SIGLIP2_MIN_SCORE/SIGLIP2_MIN_MARGIN, when set
+# directly via environment, are an explicit operator override and always
+# win over calibration.json (see get_siglip2_min_score()/
+# get_siglip2_min_margin() below). CLIP's own configuration is completely
+# untouched by anything in this module.
 SIGLIP2_MIN_SCORE = os.environ.get("SIGLIP2_MIN_SCORE")
 SIGLIP2_MIN_MARGIN = os.environ.get("SIGLIP2_MIN_MARGIN")
+
+# D-4: scripts/calibrate.py sweeps a labelled eval set and writes the
+# winning (minScore, minMargin) pair here, together with the date the
+# sweep was run. Presence of a *valid* file at this path is what flips
+# get_siglip2_calibration_status() from "uncalibrated" to
+# "calibrated:<date>" -- never a manual flag, so the status can never say
+# "calibrated" without a real file backing it.
+SIGLIP2_CALIBRATION_FILE = (
+    os.environ.get("SIGLIP2_CALIBRATION_FILE", "docs/eval/calibration.json").strip() or "docs/eval/calibration.json"
+)
+
+_REQUIRED_CALIBRATION_KEYS = ("minScore", "minMargin", "evalDate")
+
+
+def _load_siglip2_calibration_file() -> Optional[Dict[str, Any]]:
+    """Reads and validates SIGLIP2_CALIBRATION_FILE. Returns None -- never
+    a fabricated/default calibration -- if the file is missing, unreadable,
+    not a JSON object, or missing any required key. Re-read on every call
+    rather than cached at import time, so a calibration.json that appears
+    (or is replaced) while the process is running takes effect without a
+    restart, and so tests can flip SIGLIP2_CALIBRATION_FILE per-case
+    without needing to reimport this module.
+    """
+    path = Path(SIGLIP2_CALIBRATION_FILE)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not all(key in data for key in _REQUIRED_CALIBRATION_KEYS):
+        return None
+    try:
+        min_score = float(data["minScore"])
+        min_margin = float(data["minMargin"])
+    except (TypeError, ValueError):
+        return None
+    eval_date = str(data["evalDate"]).strip()
+    if not eval_date:
+        return None
+    return {"minScore": min_score, "minMargin": min_margin, "evalDate": eval_date}
+
+
+def get_siglip2_calibration_status() -> str:
+    """"uncalibrated" until a valid calibration.json exists, then
+    "calibrated:<evalDate>" from that file -- the exact field/behavior D-4
+    asks for. Never returns "calibrated" without evalDate: a bare
+    "calibrated" with no date would be exactly the kind of unverifiable
+    claim this whole calibration mechanism exists to avoid.
+    """
+    calibration = _load_siglip2_calibration_file()
+    if calibration is None:
+        return "uncalibrated"
+    return f"calibrated:{calibration['evalDate']}"
+
+
+def get_siglip2_min_score() -> Optional[float]:
+    """SIGLIP2_MIN_SCORE (an explicit operator override) wins if set;
+    otherwise calibration.json's minScore if present; otherwise None
+    (uncalibrated -- callers must not gate on this)."""
+    if SIGLIP2_MIN_SCORE is not None and str(SIGLIP2_MIN_SCORE).strip() != "":
+        try:
+            return float(SIGLIP2_MIN_SCORE)
+        except (TypeError, ValueError):
+            pass
+    calibration = _load_siglip2_calibration_file()
+    return calibration["minScore"] if calibration else None
+
+
+def get_siglip2_min_margin() -> float:
+    """Same precedence as get_siglip2_min_score(); defaults to 0.0 (no
+    margin requirement) only once a min_score is actually in effect --
+    callers gate on get_siglip2_min_score() being non-None first."""
+    if SIGLIP2_MIN_MARGIN is not None and str(SIGLIP2_MIN_MARGIN).strip() != "":
+        try:
+            return float(SIGLIP2_MIN_MARGIN)
+        except (TypeError, ValueError):
+            pass
+    calibration = _load_siglip2_calibration_file()
+    return calibration["minMargin"] if calibration else 0.0
+
 
 V2_SCORING_VERSION = os.environ.get("V2_SCORING_VERSION", "engine-match-v2").strip() or "engine-match-v2"

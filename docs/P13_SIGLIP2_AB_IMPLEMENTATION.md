@@ -72,7 +72,8 @@ initialized module.
 | `SIGLIP2_LOAD_ON_START` | `false` | If `true` *and* `SIGLIP2_ENABLED=true`, `app.py`'s startup handler blocks on a best-effort SigLIP2 warmup (model load + one inference) immediately after CLIP's own required warmup, so `siglip2_v1` is ready before the process accepts traffic. A warmup failure is caught and logged (`{"event": "engine_warmup", ...}`); it never fails process startup and never affects CLIP's own readiness — `siglip2_v1` just falls back to today's lazy-load-on-first-use behavior. Turning this on for the festival canary lengthens startup time; see `docs/P14_FESTIVAL_LIVE_GUI.md`, "Enabling SigLIP2 startup warmup," for the grace-time and pre-traffic verification steps required before doing so. |
 | `SIGLIP2_EXPECTED_DIMENSION` | `1152` | Used for validating every SigLIP2 vector before it is stored or scored. |
 | `SIGLIP2_TEXT_MAX_TOKENS` | `64` | Fallback fixed-length token count for SigLIP2 text padding, used only if the loaded tokenizer's own `model_max_length` isn't in a sane range. Never CLIP's 77-token constant. |
-| `SIGLIP2_MIN_SCORE` / `SIGLIP2_MIN_MARGIN` | unset | Optional, evaluation-derived SigLIP2 thresholds (see section 9, Calibration). Unset by default — an unset value means "uncalibrated, don't gate," never CLIP's `CONF_MIN_SCORE`/`CONF_MIN_MARGIN`. |
+| `SIGLIP2_MIN_SCORE` / `SIGLIP2_MIN_MARGIN` | unset | Optional, evaluation-derived SigLIP2 thresholds (see section 9, Calibration). An explicit value here always overrides `SIGLIP2_CALIBRATION_FILE`. Unset by default — with no env override and no valid calibration file, `get_siglip2_min_score()` returns `None`, meaning "uncalibrated, don't gate," never CLIP's `CONF_MIN_SCORE`/`CONF_MIN_MARGIN`. |
+| `SIGLIP2_CALIBRATION_FILE` | `docs/eval/calibration.json` | Path `scripts/calibrate.py` (D-4) writes to and `get_siglip2_min_score()`/`get_siglip2_min_margin()`/`get_siglip2_calibration_status()` read from, re-read on every call (no restart needed). Missing/malformed/incomplete → treated exactly as if no calibration exists. |
 | `AB_TEST_ENABLED` | `false` | Master switch for `POST /v2/ab/match`. `false` → `503 ab_testing_disabled`. |
 | `AB_UI_ENABLED` | `false` | Master switch for the Festival console's "AI Model Comparison" card (see section 13). `false` → the section is not present in the rendered HTML at all. |
 
@@ -295,11 +296,20 @@ returns:
 
 `clip_v1` keeps using CLIP's existing, production-calibrated `CONF_MIN_SCORE`/`CONF_MIN_MARGIN`/
 `CONF_TEMPERATURE` — completely untouched. `siglip2_v1`'s `calibrationStatus` is always
-`"uncalibrated"` until an operator sets `SIGLIP2_MIN_SCORE`/`SIGLIP2_MIN_MARGIN` from real
-evaluation data; until then, `/v2/match`'s and `/v2/ab/match`'s no-match decision for
+`"uncalibrated"` until a real threshold is in effect — either an operator sets
+`SIGLIP2_MIN_SCORE`/`SIGLIP2_MIN_MARGIN` directly, or `scripts/calibrate.py` (D-4, see
+`docs/eval/README.md`, "Calibration (D-4)") has written a valid `docs/eval/calibration.json`
+from real evaluation data; until then, `/v2/match`'s and `/v2/ab/match`'s no-match decision for
 `siglip2_v1` is always `{"noMatch": false, "reason": "UNCALIBRATED", ...}` — it never gates
 candidates, and it never represents a cosine score as an ownership probability (no endpoint
-formats a score as "N% certain this belongs to the user").
+formats a score as "N% certain this belongs to the user"). Once either source provides a real
+`minScore`, `calibrationStatus` flips to `"calibrated:<date>"` (the file's `evalDate`, or the
+day an explicit env override was read) — `embedding_engines/config.py`'s
+`get_siglip2_calibration_status()`/`get_siglip2_min_score()`/`get_siglip2_min_margin()` are the
+single source of truth both `Siglip2Engine.calibration_status` and `v2_router.py`'s
+`_decision_for_engine` read, so they can never disagree with each other or with what actually
+gated a given decision. An explicit `SIGLIP2_MIN_SCORE`/`SIGLIP2_MIN_MARGIN` always overrides
+`calibration.json` when both are present.
 
 ## 10. Health and observability
 
@@ -487,7 +497,9 @@ systemctl restart clip-service   # or: docker restart <container>
 CLIP's score.** A `0.91` SigLIP2 score does not mean "91% certain this belongs to the user," and
 it cannot be compared numerically against a CLIP score of `0.91` — the two models were trained
 with different objectives and different score distributions. Every SigLIP2-bearing response
-carries `"calibrationStatus": "uncalibrated"` for exactly this reason. Production thresholds for
-SigLIP2 must come from real evaluation data (`SIGLIP2_MIN_SCORE`/`SIGLIP2_MIN_MARGIN`), gathered
-using `/v2/ab/match`'s ground-truth evaluation mode and/or an offline evaluation script run
-against a labeled dataset — never copied from CLIP's `CONF_MIN_SCORE`/`CONF_MIN_MARGIN`.
+carries `"calibrationStatus": "uncalibrated"` until a real threshold, from real evaluation data,
+is actually in effect (see section 9) — never a bare "calibrated" with no date backing it.
+Production thresholds for SigLIP2 must come from real evaluation data
+(`scripts/calibrate.py`/`SIGLIP2_MIN_SCORE`/`SIGLIP2_MIN_MARGIN`, D-4), gathered using
+`/v2/ab/match`'s ground-truth evaluation mode and/or an offline evaluation script run against a
+labeled dataset — never copied from CLIP's `CONF_MIN_SCORE`/`CONF_MIN_MARGIN`.

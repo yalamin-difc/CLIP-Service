@@ -338,18 +338,21 @@ def _decision_for_engine(engine_id: str, top_score: Optional[float], second_scor
         return {"noMatch": no_match, "reason": str(meta.get("reason")), "details": meta}
     # Any other engine (siglip2_v1 today) is uncalibrated by default -- CLIP's
     # thresholds carry no meaning in a different score space and must never
-    # be silently reused (section 14). Only gate if an operator has
-    # explicitly configured a real threshold from evaluation data.
-    min_score = engine_config.SIGLIP2_MIN_SCORE
+    # be silently reused (section 14). Only gate once a real threshold is in
+    # effect -- an explicit operator override (SIGLIP2_MIN_SCORE) or a real
+    # scripts/calibrate.py run (docs/eval/calibration.json); see D-4 /
+    # get_siglip2_min_score() for the precedence between the two.
+    calibration_status = engine_config.get_siglip2_calibration_status()
+    min_score = engine_config.get_siglip2_min_score()
     if min_score is None:
         return {
             "noMatch": False,
             "reason": "UNCALIBRATED",
-            "details": {"calibrationStatus": "uncalibrated", "topScore": top_score, "secondScore": second_score},
+            "details": {"calibrationStatus": calibration_status, "topScore": top_score, "secondScore": second_score},
         }
-    min_margin = float(engine_config.SIGLIP2_MIN_MARGIN or 0.0)
-    no_match, meta = app_module.should_return_no_match(top_score, second_score, float(min_score), min_margin)
-    meta["calibrationStatus"] = "uncalibrated"
+    min_margin = engine_config.get_siglip2_min_margin()
+    no_match, meta = app_module.should_return_no_match(top_score, second_score, min_score, min_margin)
+    meta["calibrationStatus"] = calibration_status
     return {"noMatch": no_match, "reason": str(meta.get("reason")), "details": meta}
 
 
