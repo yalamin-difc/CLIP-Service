@@ -22,6 +22,7 @@ console's architecture, security model, and limitations.
 - [`docs/MODEL_CARD.md`](docs/MODEL_CARD.md) — model ID, revision, embedding dimension, intended use
 - [`docs/DEPENDENCY_MANIFEST.md`](docs/DEPENDENCY_MANIFEST.md) — pinned runtime dependencies
 - [`docs/BENCHMARK_REPORT_TEMPLATE.md`](docs/BENCHMARK_REPORT_TEMPLATE.md) — latency/throughput benchmark template
+- [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) — filled retrieval-quality report (precision@1, recall@k, MRR, PR curve, by language) — see `docs/eval/README.md`, "Retrieval-quality benchmark (D-5)"
 - [`README-DEPLOY-GPU-VM.md`](README-DEPLOY-GPU-VM.md) — GPU VM deployment notes
 - [`docs/P13_SIGLIP2_AB_IMPLEMENTATION.md`](docs/P13_SIGLIP2_AB_IMPLEMENTATION.md) — SigLIP2 alongside CLIP: dual embeddings, the `/v2` API, A/B testing, rollback
 

@@ -106,3 +106,80 @@ To turn this into a genuine accuracy benchmark:
    feed the resulting `recallAt*`/`meanReciprocalRank` numbers into a real
    calibration pass for `SIGLIP2_MIN_SCORE`/`SIGLIP2_MIN_MARGIN`
    (`embedding_engines/config.py`) — never reusing CLIP's own thresholds.
+
+## Retrieval-quality benchmark (D-5)
+
+`scripts/benchmark.py --labelled-set PATH` extends the original latency/
+throughput benchmark (`--candidates N`, unchanged) with a retrieval-
+quality harness: precision@1, recall@k (k=1, 5, 10), mean reciprocal
+rank, and a precision/recall curve, **broken out by language** (`en`,
+`ar`, `mixed`, plus `overall`). It reuses `evaluate_models.py`'s own
+`load_manifest()`/`_rank_metrics()`/`_aggregate()` rather than
+reimplementing that arithmetic, and follows the exact same
+`realEngineResults` (never-fabricated, `"status": "skipped"` with a
+reason when a real engine can't run) vs. `harnessSelfCheck`
+(deterministic, no model inference) separation as above.
+
+### Labelled-set format
+
+Same shape as the retrieval manifest, with one addition: every query
+must carry a `language` in `{"en", "ar", "mixed"}`.
+
+```jsonc
+{
+  "datasetVersion": "...",
+  "isSynthetic": true,
+  "tenantId": "...",
+  "siteId": "...",
+  "corpus": [{"candidateId": "...", "syntheticEmbeddingSeed": 101, "title": "..."}],
+  "queries": [
+    {"queryId": "...", "language": "en", "text": "...", "expectedCandidateId": "..."},
+    {"queryId": "...", "language": "ar", "text": "...", "expectedCandidateId": "..."},
+    {"queryId": "...", "language": "mixed", "text": "...", "expectedCandidateId": "..."}
+  ]
+}
+```
+
+`docs/eval/retrieval_quality_labelled_set.json` is the bundled example:
+12 hand-authored lost-and-found items, each with an English query, an
+Arabic query, and — for half of them — a code-switched EN/AR query (30
+queries total). **This is fixture data, real vocabulary and real
+grammar, but not real recovered-case data** — the same honesty rule as
+`synthetic_eval_manifest.json` above applies: a perfect self-check score
+against it proves the harness's arithmetic is correct, never that
+`clip_v1`/`siglip2_v1` will perform well on real festival reports.
+
+### Running it
+
+```bash
+python scripts/benchmark.py \
+  --labelled-set docs/eval/retrieval_quality_labelled_set.json \
+  --engine clip_v1 --engine siglip2_v1 \
+  --output docs/eval/retrieval_quality_report.json \
+  --markdown-output docs/BENCHMARK_REPORT.md
+```
+
+Writes both the full JSON report and a filled `docs/BENCHMARK_REPORT.md`
+(see `docs/BENCHMARK_REPORT_TEMPLATE.md` for the original latency-only
+template this extends). The markdown report leads with **"Measured
+retrieval quality — distinct from unit-test pass counts"** and never
+presents a `SKIPPED` real-engine section's absence of data as a
+measurement.
+
+### Why this repo's own committed report says SKIPPED for clip_v1
+
+Same root cause as `siglip2_v1` above: this repository was authored in a
+sandbox with no outbound network access to `huggingface.co` (confirmed —
+see `docs/P13_SIGLIP2_AB_IMPLEMENTATION.md`), so `openai/clip-vit-base-
+patch32`'s real weights could never be downloaded here either, and
+`transformers`/`torch` are not installed. The committed
+`docs/BENCHMARK_REPORT.md` and `docs/eval/retrieval_quality_report.json`
+are exactly what `scripts/benchmark.py` produced in this environment —
+the `harnessSelfCheck` section proves the precision/recall/MRR/PR-curve
+arithmetic is correct, and the `clip_v1` section honestly reports
+`"status": "skipped"` with the real reason, rather than a fabricated
+number. Re-running the same command from an environment with real
+network access to the pinned `MODEL_REVISION` regenerates both files
+with genuine measured numbers in place of the skipped section — nothing
+else about the format changes. `scripts/benchmark.py` never overwrites
+`app.MODEL_REVISION`; the report only ever reads and echoes it.
