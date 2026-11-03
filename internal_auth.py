@@ -13,7 +13,24 @@ from fastapi import HTTPException, Request
 
 
 JWT_ALGORITHM = "HS256"
-JWT_ISSUER = os.environ.get("INTERNAL_JWT_ISSUER", "dubai-festival-backend")
+# F1: neutral default issuer (was "dubai-festival-backend"). Must match the
+# Backend's CLIP_INTERNAL_JWT_ISSUER default (utils/internalJwt.js); both
+# stay overridable.
+DEFAULT_JWT_ISSUER = "lost-found-backend"
+
+
+def _parse_issuer_list(value: str) -> FrozenSet[str]:
+    return frozenset(part.strip() for part in (value or "").split(",") if part.strip())
+
+
+JWT_ISSUER = os.environ.get("INTERNAL_JWT_ISSUER", "").strip() or DEFAULT_JWT_ISSUER
+# F1: optional, comma-separated extra issuers accepted ONLY for a rolling
+# issuer change (e.g. "dubai-festival-backend" while the Backend is being
+# redeployed). Empty by default -- outside a rollout only JWT_ISSUER is
+# accepted. Tokens minted by this service (demo_router) always use JWT_ISSUER.
+JWT_ACCEPTED_ISSUERS = frozenset({JWT_ISSUER}) | _parse_issuer_list(
+    os.environ.get("INTERNAL_JWT_ACCEPTED_ISSUERS", "")
+)
 JWT_AUDIENCE = os.environ.get("INTERNAL_JWT_AUDIENCE", "clip-service")
 INTERNAL_JWT_SECRET = os.environ.get("INTERNAL_JWT_SECRET", "")
 
@@ -70,7 +87,7 @@ def decode_internal_jwt(token: str) -> Dict[str, Any]:
     if not hmac.compare_digest(expected, supplied):
         raise _auth_error(401, "invalid_identity", "Internal identity token signature is invalid.")
     now = int(time.time())
-    if claims.get("iss") != JWT_ISSUER or claims.get("aud") != JWT_AUDIENCE:
+    if claims.get("iss") not in JWT_ACCEPTED_ISSUERS or claims.get("aud") != JWT_AUDIENCE:
         raise _auth_error(401, "invalid_identity", "Internal identity token issuer or audience is invalid.")
     if not isinstance(claims.get("exp"), (int, float)) or int(claims["exp"]) <= now:
         raise _auth_error(401, "identity_expired", "Internal identity token has expired.")

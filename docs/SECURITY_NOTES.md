@@ -15,6 +15,27 @@ for the exact contract. Authenticated internal requests must include
 Signing keys must come from a managed secret store, contain at least 256 bits of
 entropy, and be rotated outside the service image.
 
+### Issuer configuration (F1)
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `INTERNAL_JWT_ISSUER` | `lost-found-backend` (previously `dubai-festival-backend`) | The issuer this service expects. It must match the Backend's `CLIP_INTERNAL_JWT_ISSUER`. A blank value uses the default. |
+| `INTERNAL_JWT_ACCEPTED_ISSUERS` | empty | A comma-separated list of extra issuers that are accepted **only during an issuer rollout**, for example `dubai-festival-backend` while the Backend is redeployed. Leave it empty at all other times. |
+| `INTERNAL_JWT_AUDIENCE` | `clip-service` | It must match the Backend's `CLIP_INTERNAL_JWT_AUDIENCE`. |
+
+Tokens this service mints for itself (the demo facade) always use
+`INTERNAL_JWT_ISSUER`. A token from any issuer that is not configured is
+rejected with `401 invalid_identity`.
+
+### Pilot deployments
+
+In a pilot, keep `DEMO_FACADE_ENABLED=false` (the default). Then every
+`/demo/*` route returns 404, even when the other `DEMO_*` values are set.
+`tests/test_pilot_config_f1.py` lists the app's routes and checks each
+`/demo/*` route, so any `/demo/*` route added later is checked too. Keep
+`INTERNAL_JWT_ACCEPTED_ISSUERS` empty. The full list of pilot settings is
+in the Backend's `docs/PILOT_CONFIGURATION.md`.
+
 Required actions are `corpus:write`, `corpus:release`, `corpus:read`,
 `match:execute`, `health:read`, and `metrics:read`. Browser clients must call the
 trusted backend; CORS is not an authentication control.
