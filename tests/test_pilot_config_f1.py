@@ -9,10 +9,10 @@
    overridable via INTERNAL_JWT_ISSUER, and accepts an extra issuer only
    when one is explicitly listed in INTERNAL_JWT_ACCEPTED_ISSUERS.
 """
-import json
+import importlib.util
+import itertools
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
@@ -56,22 +56,24 @@ def _demo_routes():
     return routes
 
 
-def _run_isolated(code: str, env_overrides: dict) -> str:
-    """Import a module in a fresh interpreter so module-level env parsing
-    is exercised exactly as at service start-up."""
+_ISOLATED_COUNTER = itertools.count()
+
+
+def _load_isolated(module_name: str, env_overrides: dict):
+    """Execute a fresh, private copy of a top-level module under a patched
+    environment, so its module-level env parsing runs exactly as it does at
+    service start-up. The copy gets a unique name and is registered in
+    sys.modules only while it executes (dataclasses need that), so the
+    shared internal_auth/demo_config modules the app uses are untouched."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("INTERNAL_JWT_", "DEMO_"))}
     env.update(env_overrides)
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=str(ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
+    spec = importlib.util.spec_from_file_location(
+        f"_f1_isolated_{module_name}_{next(_ISOLATED_COUNTER)}", ROOT / f"{module_name}.py"
     )
-    if result.returncode != 0:
-        raise AssertionError(result.stderr)
-    return result.stdout.strip().splitlines()[-1]
+    module = importlib.util.module_from_spec(spec)
+    with patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, {spec.name: module}):
+        spec.loader.exec_module(module)
+    return module
 
 
 class DemoFacadeDisabledForPilotTests(unittest.TestCase):
@@ -116,11 +118,10 @@ class DemoFacadeDisabledForPilotTests(unittest.TestCase):
                         self.assertNotIn(value, body)
 
     def test_demo_facade_enabled_false_env_value_disables_facade_at_startup(self):
-        code = "import demo_config, json; print(json.dumps([demo_config.DEMO_FACADE_ENABLED, demo_config.demo_config_ready()]))"
         for raw in ("false", "False", "0", "no", "", "off"):
             with self.subTest(DEMO_FACADE_ENABLED=raw):
-                out = _run_isolated(
-                    code,
+                isolated = _load_isolated(
+                    "demo_config",
                     {
                         "DEMO_FACADE_ENABLED": raw,
                         "DEMO_TENANT_ID": "pilot-tenant",
@@ -129,11 +130,11 @@ class DemoFacadeDisabledForPilotTests(unittest.TestCase):
                         "DEMO_ASSET_DIR": "/opt/demo-data",
                     },
                 )
-                self.assertEqual(json.loads(out), [False, False])
+                self.assertFalse(isolated.DEMO_FACADE_ENABLED)
+                self.assertFalse(isolated.demo_config_ready())
 
     def test_demo_facade_unset_defaults_to_disabled(self):
-        out = _run_isolated("import demo_config; print(demo_config.DEMO_FACADE_ENABLED)", {})
-        self.assertEqual(out, "False")
+        self.assertFalse(_load_isolated("demo_config", {}).DEMO_FACADE_ENABLED)
 
 
 def _token(issuer: str) -> str:
@@ -165,29 +166,22 @@ class IssuerConfigurationTests(unittest.TestCase):
 
     def test_default_issuer_is_neutral(self):
         self.assertEqual(internal_auth.DEFAULT_JWT_ISSUER, "lost-found-backend")
-        out = _run_isolated(
-            "import internal_auth, json; print(json.dumps([internal_auth.JWT_ISSUER, sorted(internal_auth.JWT_ACCEPTED_ISSUERS)]))",
-            {},
-        )
-        self.assertEqual(json.loads(out), ["lost-found-backend", ["lost-found-backend"]])
+        isolated = _load_isolated("internal_auth", {})
+        self.assertEqual(isolated.JWT_ISSUER, "lost-found-backend")
+        self.assertEqual(isolated.JWT_ACCEPTED_ISSUERS, frozenset({"lost-found-backend"}))
 
     def test_issuer_overridable_via_configuration(self):
-        out = _run_isolated(
-            "import internal_auth, json; print(json.dumps([internal_auth.JWT_ISSUER, sorted(internal_auth.JWT_ACCEPTED_ISSUERS)]))",
-            {"INTERNAL_JWT_ISSUER": "pilot-backend"},
-        )
-        self.assertEqual(json.loads(out), ["pilot-backend", ["pilot-backend"]])
+        isolated = _load_isolated("internal_auth", {"INTERNAL_JWT_ISSUER": "pilot-backend"})
+        self.assertEqual(isolated.JWT_ISSUER, "pilot-backend")
+        self.assertEqual(isolated.JWT_ACCEPTED_ISSUERS, frozenset({"pilot-backend"}))
 
     def test_blank_issuer_env_falls_back_to_default_not_empty(self):
-        out = _run_isolated("import internal_auth; print(internal_auth.JWT_ISSUER)", {"INTERNAL_JWT_ISSUER": "  "})
-        self.assertEqual(out, "lost-found-backend")
+        isolated = _load_isolated("internal_auth", {"INTERNAL_JWT_ISSUER": "  "})
+        self.assertEqual(isolated.JWT_ISSUER, "lost-found-backend")
 
     def test_accepted_issuers_list_parsed_for_rollout(self):
-        out = _run_isolated(
-            "import internal_auth, json; print(json.dumps(sorted(internal_auth.JWT_ACCEPTED_ISSUERS)))",
-            {"INTERNAL_JWT_ACCEPTED_ISSUERS": " dubai-festival-backend , ,"},
-        )
-        self.assertEqual(json.loads(out), ["dubai-festival-backend", "lost-found-backend"])
+        isolated = _load_isolated("internal_auth", {"INTERNAL_JWT_ACCEPTED_ISSUERS": " dubai-festival-backend , ,"})
+        self.assertEqual(isolated.JWT_ACCEPTED_ISSUERS, frozenset({"dubai-festival-backend", "lost-found-backend"}))
 
     def test_configured_issuer_accepted(self):
         with patch.object(internal_auth, "JWT_ACCEPTED_ISSUERS", frozenset({"lost-found-backend"})):
