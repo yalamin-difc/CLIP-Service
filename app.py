@@ -112,6 +112,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# F4: the public festival console ("/", "/ui" and its "/static/*" assets)
+# is served only when CONSOLE_ENABLED=true. Default false: a pilot or any
+# deployment that has not opted in answers those paths exactly like an
+# unknown path (404 {"detail": "Not Found"}). Demo/festival deployments set
+# CONSOLE_ENABLED=true and behave exactly as before. Health, docs and every
+# authenticated API route are unaffected.
+CONSOLE_ENABLED = os.environ.get("CONSOLE_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def is_console_path(path: str) -> bool:
+    return path in ("/", "/ui") or path.startswith("/static/")
+
+
 # Festival console: static assets for the "/" landing page only. Every
 # protected API route below is untouched -- this mount serves CSS/JS files,
 # nothing else.
@@ -133,11 +146,15 @@ _CONSOLE_CSP = (
 
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
-    response = await call_next(request)
+    path = request.url.path
+    if not CONSOLE_ENABLED and is_console_path(path):
+        # F4: identical to Starlette's own unknown-route response.
+        response = JSONResponse({"detail": "Not Found"}, status_code=404)
+    else:
+        response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    path = request.url.path
-    if path == "/" or path.startswith("/static/"):
+    if CONSOLE_ENABLED and (path == "/" or path.startswith("/static/")):
         response.headers["Content-Security-Policy"] = _CONSOLE_CSP
         response.headers["X-Frame-Options"] = "DENY"
     return response

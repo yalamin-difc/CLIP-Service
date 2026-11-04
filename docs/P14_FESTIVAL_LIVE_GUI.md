@@ -158,6 +158,7 @@ malformed `candidateFilename` in Mongo can never produce a path-escaping URL.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DEMO_FACADE_ENABLED` | `false` | Master switch. `false` -> every `/demo/*` route 404s. |
+| `CONSOLE_ENABLED` | `false` | F4: serves the public console (`/`, `/ui`, `/static/*`). `false` -> those paths 404 like an unknown path. The festival deployment must set `true`. |
 | `DEMO_TENANT_ID` | *(empty)* | Server-controlled tenant for every demo request. Required. |
 | `DEMO_SITE_ID` | *(empty)* | Server-controlled site. Required. |
 | `DEMO_DATASET_VERSION` | *(empty)* | Server-controlled dataset version. Required. |
@@ -263,6 +264,7 @@ docker run -d --name clip-service-canary -p 8080:8080 \
   -e SIGLIP2_DEVICE=cpu -e SIGLIP2_LOAD_ON_START=false \
   -e AB_TEST_ENABLED=true \
   -e DEMO_FACADE_ENABLED=true \
+  -e CONSOLE_ENABLED=true \
   -e DEMO_TENANT_ID=festival-demo \
   -e DEMO_SITE_ID=dubai-ai-festival \
   -e DEMO_DATASET_VERSION=daf-2026-v1 \
@@ -295,6 +297,7 @@ docker run -d --name clip-service-canary -p 8080:8080 \
   -e SIGLIP2_DEVICE=cpu -e SIGLIP2_LOAD_ON_START=true \
   -e AB_TEST_ENABLED=true \
   -e DEMO_FACADE_ENABLED=true \
+  -e CONSOLE_ENABLED=true \
   -e DEMO_TENANT_ID=festival-demo \
   -e DEMO_SITE_ID=dubai-ai-festival \
   -e DEMO_DATASET_VERSION=daf-2026-v1 \

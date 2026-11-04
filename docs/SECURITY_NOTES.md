@@ -57,6 +57,12 @@ The Backend's `npm run pilot:verify-clean -- --check-clip` signs an
 
 ### Pilot deployments
 
+Leave `CONSOLE_ENABLED` unset or `false` (the default). Then `/`, `/ui` and
+`/static/*` answer exactly like an unknown path: a 404 with
+`{"detail": "Not Found"}` and without the console's CSP headers.
+`tests/test_console_flag_f4.py` covers this, and also checks that the
+console is unchanged when the flag is on.
+
 In a pilot, keep `DEMO_FACADE_ENABLED=false` (the default). Then every
 `/demo/*` route returns 404, even when the other `DEMO_*` values are set.
 `tests/test_pilot_config_f1.py` lists the app's routes and checks each

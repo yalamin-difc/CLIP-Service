@@ -16,6 +16,21 @@ import internal_auth
 from embedding_engines import config as engine_config
 from test_app import TEST_SECRET
 
+# F4: these tests describe the demo/festival build, which serves the public
+# console with CONSOLE_ENABLED=true (the default is false).
+_console_patch = None
+
+
+def setUpModule():
+    global _console_patch
+    _console_patch = patch.object(clip_service, "CONSOLE_ENABLED", True)
+    _console_patch.start()
+
+
+def tearDownModule():
+    _console_patch.stop()
+
+
 
 class FestivalAbUiTests(unittest.TestCase):
     def setUp(self):
