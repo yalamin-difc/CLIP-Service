@@ -45,3 +45,10 @@ python scripts/ci_static_checks.py
 Docker images: `Dockerfile.cpu` (default) and `Dockerfile.gpu` (CUDA). Both
 require `INTERNAL_JWT_SECRET` (>= 32 bytes), `MONGODB_URI` when
 `STORAGE_MODE=mongodb`, and an explicit `INFERENCE_DEVICE` (`cpu` or `cuda`).
+
+The expected internal JWT issuer is `INTERNAL_JWT_ISSUER`. Its default is
+`lost-found-backend`, which matches the Backend's `CLIP_INTERNAL_JWT_ISSUER`
+default. See [`docs/SECURITY_NOTES.md`](docs/SECURITY_NOTES.md#issuer-configuration-f1)
+for the rollout setting `INTERNAL_JWT_ACCEPTED_ISSUERS`. For pilot
+deployments, keep `DEMO_FACADE_ENABLED=false` (the default), so that every
+`/demo/*` route returns 404.
