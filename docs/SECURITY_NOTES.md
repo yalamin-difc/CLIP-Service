@@ -27,17 +27,47 @@ Tokens this service mints for itself (the demo facade) always use
 `INTERNAL_JWT_ISSUER`. A token from any issuer that is not configured is
 rejected with `401 invalid_identity`.
 
+### Index counts per tenant and site (F2)
+
+`GET /admin/index-counts` reports how many items are indexed for the
+signed identity's tenant and for each of its permitted sites. Use it
+before go-live to check that a pilot's index is empty.
+
+- **Off by default.** It runs only when `ADMIN_INDEX_COUNTS_ENABLED=true`.
+  When the setting is off, the route returns 404, exactly like an unknown
+  path.
+- **Needs its own action, `index:count`.** A token with only this action
+  cannot read, write, release or match corpus items. A token without it is
+  rejected with 403.
+- **Scoped by the token, never by the request.** It counts only the
+  token's `tenantId` and `siteIds`. Query parameters cannot widen that
+  scope, and another tenant's items are never counted, even on a site with
+  the same name.
+- **Returns counts only.** Each site reports `total`, `released`, `demo`,
+  `nonDemo` and `byStatus`. No item IDs, titles, descriptions or embeddings
+  are returned. Demo and production items are both counted, whatever the
+  token's `demoData` claim says, because the aim is to see whether anything
+  is indexed at all.
+- **Read-only and audited.** Each call adds an
+  `admin_index_counts_read` audit entry with the tenant, the site IDs and
+  the total.
+
+The Backend's `npm run pilot:verify-clean -- --check-clip` signs an
+`index:count` token and calls this endpoint.
+
 ### Pilot deployments
 
 In a pilot, keep `DEMO_FACADE_ENABLED=false` (the default). Then every
 `/demo/*` route returns 404, even when the other `DEMO_*` values are set.
 `tests/test_pilot_config_f1.py` lists the app's routes and checks each
 `/demo/*` route, so any `/demo/*` route added later is checked too. Keep
-`INTERNAL_JWT_ACCEPTED_ISSUERS` empty. The full list of pilot settings is
+`INTERNAL_JWT_ACCEPTED_ISSUERS` empty. Turn on `ADMIN_INDEX_COUNTS_ENABLED`
+only while checking that the pilot index is empty, and turn it off again
+afterwards. The full list of pilot settings is
 in the Backend's `docs/PILOT_CONFIGURATION.md`.
 
 Required actions are `corpus:write`, `corpus:release`, `corpus:read`,
-`match:execute`, `health:read`, and `metrics:read`. Browser clients must call the
+`match:execute`, `health:read`, `metrics:read`, and `index:count` (F2, below). Browser clients must call the
 trusted backend; CORS is not an authentication control.
 
 ## Data protection

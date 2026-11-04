@@ -92,6 +92,10 @@ APPROVED_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 SCORING_VERSION = "clip-match-v1"
 CORPUS_LIMIT = int(os.environ.get("CORPUS_LIMIT", "50000"))
 EXPECTED_EMBEDDING_DIMENSION = int(os.environ.get("EXPECTED_EMBEDDING_DIMENSION", "512"))
+# F2: read-only GET /admin/index-counts (per tenant/site item counts, used to
+# check a pilot index is empty before go-live). Off by default: when false
+# the route returns 404 exactly like an unknown path.
+ADMIN_INDEX_COUNTS_ENABLED = os.environ.get("ADMIN_INDEX_COUNTS_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 
 request_limiter = anyio.CapacityLimiter(max(1, REQUEST_CONCURRENCY))
 ocr_limiter = anyio.CapacityLimiter(max(1, OCR_CONCURRENCY))
@@ -1422,6 +1426,26 @@ def assert_dataset_scope_consistent(existing: Optional[Mapping[str, Any]], ident
         )
 
 
+def empty_site_counts(site_id: str) -> Dict[str, Any]:
+    """F2: the per-site shape GET /admin/index-counts returns -- counts
+    only, never item content or identifiers."""
+    return {"siteId": site_id, "total": 0, "released": 0, "demo": 0, "nonDemo": 0, "byStatus": {}}
+
+
+def add_to_site_counts(
+    site_counts: Dict[str, Any], *, status: Optional[str], released: bool, demo: bool, count: int = 1
+) -> None:
+    site_counts["total"] += count
+    if released:
+        site_counts["released"] += count
+    if demo:
+        site_counts["demo"] += count
+    else:
+        site_counts["nonDemo"] += count
+    status_key = status if isinstance(status, str) and status else "unknown"
+    site_counts["byStatus"][status_key] = site_counts["byStatus"].get(status_key, 0) + count
+
+
 class ItemRepository:
     def health(self) -> Dict[str, Any]:
         raise NotImplementedError
@@ -1436,6 +1460,13 @@ class ItemRepository:
         raise NotImplementedError
 
     def list_items(self, identity: ServiceIdentity, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def count_items_by_site(self, identity: ServiceIdentity) -> List[Dict[str, Any]]:
+        """F2: read-only per-site counts of indexed items for this
+        identity's tenant and permitted sites only. Counts every item in
+        that scope regardless of demoData/datasetVersion (the point is to
+        see whether ANYTHING is indexed there); never returns item content."""
         raise NotImplementedError
 
     def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
@@ -1514,6 +1545,20 @@ class InMemoryItemRepository(ItemRepository):
             items = [item for item in items if item.get("status") == status]
         items.sort(key=lambda item: item.get("updatedAt") or "", reverse=True)
         return items[:limit]
+
+    def count_items_by_site(self, identity: ServiceIdentity) -> List[Dict[str, Any]]:
+        counts = {site_id: empty_site_counts(site_id) for site_id in identity.permitted_site_ids}
+        with self._lock:
+            for value in self._items.values():
+                if value.get("tenantId") != identity.tenant_id or value.get("siteId") not in counts:
+                    continue
+                add_to_site_counts(
+                    counts[value["siteId"]],
+                    status=value.get("status"),
+                    released=bool(value.get("released")),
+                    demo=bool(value.get("demoData")),
+                )
+        return [counts[site_id] for site_id in sorted(counts)]
 
     def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
         with self._lock:
@@ -1603,6 +1648,9 @@ class UnavailableItemRepository(ItemRepository):
     def list_items(self, identity: ServiceIdentity, status: Optional[str] = None, limit: int = 5000) -> List[Dict[str, Any]]:
         self._raise()
 
+    def count_items_by_site(self, identity: ServiceIdentity) -> List[Dict[str, Any]]:
+        self._raise()
+
     def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
         self._raise()
 
@@ -1690,6 +1738,36 @@ class MongoItemRepository(ItemRepository):
             query["status"] = status
         cursor = self._items.find(query).sort("updatedAt", -1).limit(limit)
         return [self._clean_item(item) for item in cursor if item is not None]
+
+    def count_items_by_site(self, identity: ServiceIdentity) -> List[Dict[str, Any]]:
+        counts = {site_id: empty_site_counts(site_id) for site_id in identity.permitted_site_ids}
+        pipeline = [
+            {"$match": {"tenantId": identity.tenant_id, "siteId": {"$in": sorted(counts)}}},
+            {
+                "$group": {
+                    "_id": {
+                        "siteId": "$siteId",
+                        "status": "$status",
+                        "released": {"$eq": ["$released", True]},
+                        "demo": {"$eq": ["$demoData", True]},
+                    },
+                    "count": {"$sum": 1},
+                }
+            },
+        ]
+        for row in self._items.aggregate(pipeline):
+            key = row.get("_id") or {}
+            site_id = key.get("siteId")
+            if site_id not in counts:
+                continue
+            add_to_site_counts(
+                counts[site_id],
+                status=key.get("status"),
+                released=bool(key.get("released")),
+                demo=bool(key.get("demo")),
+                count=int(row.get("count") or 0),
+            )
+        return [counts[site_id] for site_id in sorted(counts)]
 
     def list_released_items(self, identity: ServiceIdentity, limit: int = 5000) -> List[Dict[str, Any]]:
         cursor = (
@@ -2690,6 +2768,32 @@ async def reembed_item(request: Request, item_id: str, file: UploadFile = File(.
         tenant_id=identity.tenant_id,
     )
     return with_request_id(request, {"item": serialize_item(saved)})
+
+
+@app.get("/admin/index-counts")
+def admin_index_counts(request: Request):
+    """F2: read-only count of indexed items per site, for the signed
+    identity's tenant and permitted sites only. Requires the dedicated
+    "index:count" action, so a token that may count cannot read, write,
+    release or match corpus items. Returns counts only -- no item IDs,
+    titles, descriptions, embeddings or other content."""
+    if not ADMIN_INDEX_COUNTS_ENABLED:
+        raise HTTPException(status_code=404, detail=problem_detail("not_found", "Not found."))
+    started = time.time()
+    endpoint = "/admin/index-counts"
+    identity = authorize(request, "index:count")
+    repository = get_repository()
+    sites = repository.count_items_by_site(identity)
+    total = sum(site["total"] for site in sites)
+    repository.add_audit_log(
+        "admin_index_counts_read",
+        {"siteIds": [site["siteId"] for site in sites], "total": total, "service": identity.service_name},
+        request_id=identity.request_id,
+        tenant_id=identity.tenant_id,
+    )
+    record_latency_metric(endpoint, started)
+    record_request_metric(endpoint, 200)
+    return with_request_id(request, {"tenantId": identity.tenant_id, "total": total, "sites": sites})
 
 
 @app.get("/audit-logs")
