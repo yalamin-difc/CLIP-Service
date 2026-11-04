@@ -52,3 +52,9 @@ default. See [`docs/SECURITY_NOTES.md`](docs/SECURITY_NOTES.md#issuer-configurat
 for the rollout setting `INTERNAL_JWT_ACCEPTED_ISSUERS`. For pilot
 deployments, keep `DEMO_FACADE_ENABLED=false` (the default), so that every
 `/demo/*` route returns 404.
+
+To check that a pilot's index is empty before go-live, set
+`ADMIN_INDEX_COUNTS_ENABLED=true` for the check. This turns on the
+read-only `GET /admin/index-counts` endpoint, which needs the `index:count`
+action and returns per-site counts only. See
+[`docs/SECURITY_NOTES.md`](docs/SECURITY_NOTES.md#index-counts-per-tenant-and-site-f2).
