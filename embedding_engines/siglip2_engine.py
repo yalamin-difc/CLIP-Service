@@ -67,6 +67,13 @@ class Siglip2Engine(EmbeddingEngine):
         # inference has actually worked (see readiness() below).
         self._inference_succeeded = False
         self._inference_limiter = anyio.CapacityLimiter(1)
+        # D-3: a cheap fingerprint of the *actual loaded weight tensors*,
+        # set once load() succeeds. Distinct from _preprocessing_version
+        # (which only fingerprints the processor's config, not the model's
+        # weights) -- this is the startup canary's evidence that real
+        # weights were loaded, independent of whatever revision string was
+        # configured. None until a load has actually completed.
+        self._weight_checksum: Optional[str] = None
 
     # -- configuration -----------------------------------------------
     def is_enabled(self) -> bool:
@@ -146,6 +153,11 @@ class Siglip2Engine(EmbeddingEngine):
                 self._processor = processor
                 self._model = model
                 self._preprocessing_version = self._compute_preprocessing_version(processor)
+                # D-3 startup canary: fingerprint the actual loaded weight
+                # tensors (never the config, never invented) so the log
+                # line below is evidence real weights loaded, not just
+                # that SIGLIP2_MODEL_REVISION was set to some string.
+                self._weight_checksum = self._compute_weight_checksum(model)
                 self._load_error_category = None
                 load_seconds = time.time() - load_started
                 logger.info(
@@ -156,6 +168,7 @@ class Siglip2Engine(EmbeddingEngine):
                             "modelId": self.model_id,
                             "modelRevision": self.model_revision,
                             "preprocessingVersion": self._preprocessing_version,
+                            "weightChecksum": self._weight_checksum,
                             "device": device,
                             "loadSeconds": round(load_seconds, 3),
                         }
@@ -205,6 +218,43 @@ class Siglip2Engine(EmbeddingEngine):
             return None
         serialized = json.dumps(fingerprint_source, sort_keys=True, default=str)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _compute_weight_checksum(model_instance: Any) -> Optional[str]:
+        """D-3: a cheap, deterministic fingerprint of the model's *actual
+        loaded weight tensors* -- not a cryptographic integrity guarantee,
+        and never a substitute for docs/AZURE_CANARY_VERIFICATION.md's
+        on-disk snapshot-directory check. Hashes each parameter's name,
+        shape, and dtype plus a small deterministic sample of its real
+        values (never every element -- so400m has ~400M parameters, and a
+        canary/log-line fingerprint does not need to hash all of them to
+        detect "these are different weights than last time"). Returns None
+        (never a fabricated value) if the model exposes no state_dict() or
+        anything about it can't be read -- a missing checksum is reported
+        as missing, not guessed at.
+        """
+        try:
+            state_dict = model_instance.state_dict()
+        except Exception:
+            return None
+        try:
+            hasher = hashlib.sha256()
+            for name in sorted(state_dict.keys()):
+                tensor = state_dict[name]
+                hasher.update(name.encode("utf-8"))
+                hasher.update(str(tuple(getattr(tensor, "shape", ()) or ())).encode("utf-8"))
+                hasher.update(str(getattr(tensor, "dtype", "")).encode("utf-8"))
+                flat = tensor.detach().reshape(-1) if hasattr(tensor, "detach") else np.asarray(tensor).reshape(-1)
+                count = int(flat.shape[0]) if hasattr(flat, "shape") else len(flat)
+                if count:
+                    stride = max(1, count // 8)
+                    sample = flat[::stride]
+                    sample = sample.cpu() if hasattr(sample, "cpu") else sample
+                    sample_array = sample.numpy() if hasattr(sample, "numpy") else np.asarray(sample)
+                    hasher.update(sample_array.tobytes())
+            return hasher.hexdigest()[:16]
+        except Exception:  # pragma: no cover - defensive; a fingerprint must never break a real load
+            return None
 
     def _text_max_tokens(self) -> int:
         tokenizer = getattr(self._processor, "tokenizer", None)

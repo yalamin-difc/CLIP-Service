@@ -106,6 +106,35 @@ and set `SIGLIP2_MODEL_REVISION` to that commit SHA, so the model can never sile
 underneath a running deployment. `MODEL_REVISION` for CLIP (already pinned to
 `3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268` in `app.py`) is untouched.
 
+**D-3 (enforced, not just documented):** this is no longer only an operator obligation written
+down here — `embedding_engines/config.py`'s `validate_siglip2_configuration()`, called
+unconditionally from `app.py`'s `initialize_runtime()` before any engine warmup, now **rejects
+process startup** (raises `RuntimeError`) if `SIGLIP2_ENABLED=true` and `SIGLIP2_MODEL_REVISION`
+is empty or (case-insensitively) `"main"`/`"latest"`. This check runs regardless of
+`SIGLIP2_LOAD_ON_START`, so a misconfigured deployment fails immediately at startup rather than
+serving an unpinned, driftable model whenever SigLIP2 is first actually invoked (which, with the
+default `SIGLIP2_LOAD_ON_START=false`, could be long after startup, on a live request). See
+`tests/test_siglip2_revision_pinning.py` for the enforcement's test coverage.
+
+Separately, `Siglip2Engine.load()` now computes and logs a **weight checksum** — a fingerprint of
+the actually-loaded weight tensors (parameter names, shapes, dtypes, and a deterministic sample of
+real values; never every element of a ~400M-parameter model, and never a substitute for
+`docs/AZURE_CANARY_VERIFICATION.md`'s on-disk snapshot-directory check) — alongside the resolved
+revision in its `model_load` structured log line:
+
+```json
+{"event": "model_load", "engine": "siglip2_v1", "modelId": "google/siglip2-so400m-patch14-384",
+ "modelRevision": "<configured-revision>", "preprocessingVersion": "<fingerprint>",
+ "weightChecksum": "<weight-fingerprint>", "device": "cpu", "loadSeconds": 2.41}
+```
+
+This is the startup canary described in `Siglip2Engine.warmup()`'s own docstring (triggered from
+`initialize_runtime() -> warmup_optional_engines()` when `SIGLIP2_LOAD_ON_START=true`) — it now
+additionally gives an operator evidence that *real weights* loaded, not just that
+`SIGLIP2_MODEL_REVISION` was set to some string. A `null` `weightChecksum` means the loaded
+model object exposed no `state_dict()` (e.g. an unexpected model class) — worth investigating even
+if the load otherwise "succeeded."
+
 ## 3. API endpoints
 
 ### Legacy (unchanged contracts, unchanged defaults)
