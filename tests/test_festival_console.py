@@ -24,6 +24,21 @@ import app as clip_service
 import internal_auth
 from test_app import FakeModel, FakeProcessor, TEST_SECRET, identity_headers, make_image_bytes
 
+# F4: these tests describe the demo/festival build, which serves the public
+# console with CONSOLE_ENABLED=true (the default is false).
+_console_patch = None
+
+
+def setUpModule():
+    global _console_patch
+    _console_patch = patch.object(clip_service, "CONSOLE_ENABLED", True)
+    _console_patch.start()
+
+
+def tearDownModule():
+    _console_patch.stop()
+
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 

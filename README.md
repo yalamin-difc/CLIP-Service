@@ -8,6 +8,12 @@ authority; see [`docs/C01_BACKEND_INTEROPERABILITY.md`](docs/C01_BACKEND_INTEROP
 
 ## Festival deployment
 
+The public console (`/`, `/ui` and its `/static/*` assets) is served only
+when **`CONSOLE_ENABLED=true`**. The default is `false`, and then those
+paths return the same 404 as an unknown path. The festival deployment must
+set `CONSOLE_ENABLED=true`; pilot deployments leave it unset. Health,
+`/docs` and the authenticated API do not depend on this setting.
+
 - Festival Console: https://clip.al-amentech.io/
 - Swagger: https://clip.al-amentech.io/docs
 - Readiness: https://clip.al-amentech.io/health/ready
@@ -50,8 +56,9 @@ The expected internal JWT issuer is `INTERNAL_JWT_ISSUER`. Its default is
 `lost-found-backend`, which matches the Backend's `CLIP_INTERNAL_JWT_ISSUER`
 default. See [`docs/SECURITY_NOTES.md`](docs/SECURITY_NOTES.md#issuer-configuration-f1)
 for the rollout setting `INTERNAL_JWT_ACCEPTED_ISSUERS`. For pilot
-deployments, keep `DEMO_FACADE_ENABLED=false` (the default), so that every
-`/demo/*` route returns 404.
+deployments, keep `DEMO_FACADE_ENABLED=false` and `CONSOLE_ENABLED=false`
+(both are the default), so that every `/demo/*` route and the public console
+return 404.
 
 To check that a pilot's index is empty before go-live, set
 `ADMIN_INDEX_COUNTS_ENABLED=true` for the check. This turns on the
